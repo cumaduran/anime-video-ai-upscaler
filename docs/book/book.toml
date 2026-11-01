@@ -1,0 +1,8 @@
+[book]
+authors = ["cumaduran"]
+language = "tr"
+multilingual = false
+title = "Anime Video Upscaler & Encoder Rehberi"
+
+[output.html]
+default-theme = "ayu"

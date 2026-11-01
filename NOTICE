@@ -1,0 +1,25 @@
+Video2X
+Copyright (C) 2018-2024 K4YT3X and contributors.
+
+This product depends on FFmpeg, available under LGPL 2.1 or, when GPL components are enabled, GPL.
+The source code can be found at https://github.com/FFmpeg/FFmpeg.
+
+This product depends on Anime4K, which is available under the MIT License.
+The source code can be found at https://github.com/bloc97/Anime4K.
+
+This product depends on Real-ESRGAN ncnn Vulkan, which is available under the MIT License.
+The source code can be found at https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan.
+
+This product depends on Real-CUGAN ncnn Vulkan, which is available under the MIT License.
+The source code can be found at https://github.com/nihui/realcugan-ncnn-vulkan.
+
+This product depends on RIFE ncnn Vulkan, which is available under the MIT License.
+The source code can be found at https://github.com/nihui/rife-ncnn-vulkan.
+
+This product depends on ncnn, which is available under the BSD 3-Clause License.
+The source code can be found at https://github.com/Tencent/ncnn.
+
+Anime Video Upscaler & Encoder desktop workflow, documentation, and original moon-fox SVG icon
+Copyright (C) 2026 @cumaduran. Licensed under the repository AGPL-3.0 license.
+The Qt UI uses PySide6/Qt (LGPLv3/GPLv3/commercial); dependency notices must be
+reviewed and included when packaging is explicitly authorized.

@@ -30,3 +30,42 @@
 *.exe
 *.out
 *.app
+
+# Local environments, editor state and test caches
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Generated builds and local runtime
+/build/
+/dist/
+/runtime/
+/tools/
+/third_party/
+*.spec
+*.log
+*.tmp
+*.pdb
+*.ilk
+
+# Personal media and credentials
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+.env
+.env.*
+!.env.example
+*.pem
+*.key

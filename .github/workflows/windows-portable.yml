@@ -1,0 +1,91 @@
+name: Windows build and release
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
+        with:
+          python-version: '3.12'
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m venv .venv-anime
+          .\.venv-anime\Scripts\python.exe -m pip install -r app\anime_video_upscaler\requirements-ci.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
+      - name: Prepare dependencies and build native engine
+        shell: pwsh
+        run: |
+          .\.venv-anime\Scripts\python.exe scripts\prepare-independent-deps.py
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency preparation failed.' }
+          .\.venv-anime\Scripts\python.exe scripts\prepare-native-toolchain.py
+          if ($LASTEXITCODE -ne 0) { throw 'Native toolchain preparation failed.' }
+          .\.venv-anime\Scripts\python.exe scripts\build-independent-engine.py
+          if ($LASTEXITCODE -ne 0) { throw 'Native engine build failed.' }
+      - name: Prepare bundled runtime
+        shell: pwsh
+        run: .\scripts\prepare-ci-runtime.ps1
+      - name: Run application tests without GPU
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $env:ANIME_TEST_FFMPEG = "$PWD\runtime\ffmpeg\ffmpeg.exe"
+          $env:ANIME_TEST_FFPROBE = "$PWD\runtime\ffmpeg\ffprobe.exe"
+          .\.venv-anime\Scripts\python.exe -m pytest -q -m 'not gpu'
+          if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
+      - name: Build portable EXE
+        shell: pwsh
+        run: .\scripts\build-dev-portable.ps1
+      - name: Smoke test and archive
+        shell: pwsh
+        run: .\scripts\ci-package-smoke.ps1
+      - name: Upload development package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: anime-video-upscaler-windows
+          path: |
+            build/ci-package/Anime-Video-Upscaler-Windows.zip
+            build/ci-package/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+  release:
+    needs: build
+    if: github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the tested package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: anime-video-upscaler-windows
+          path: package
+      - name: Attach package to the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd package
+          sha256sum --check SHA256SUMS.txt
+          gh release upload "$RELEASE_TAG" Anime-Video-Upscaler-Windows.zip SHA256SUMS.txt --clobber
