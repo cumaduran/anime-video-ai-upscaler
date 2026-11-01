@@ -15,6 +15,7 @@
 *.so
 *.dylib
 *.dll
+!vendor/vulkan/vulkan-1.dll
 
 # Fortran module files
 *.mod

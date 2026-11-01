@@ -10,10 +10,11 @@ $ffmpeg = Join-Path $deps 'ffmpeg-shared\ffmpeg-n7.1.5-12-g1fdbca85aa-win64-gpl-
 $ffmpegCli = Join-Path $deps 'ffmpeg-cli\ffmpeg-9.0.2-essentials_build'
 $ncnn = Join-Path $deps 'ncnn\ncnn-20240820-windows-vs2022-shared\x64'
 $cugan = Join-Path $deps 'realcugan\realcugan-ncnn-vulkan-20220728-windows'
-$vulkan = Join-Path $deps 'vulkan-runtime\VulkanRT-1.3.296.0-Components\x64\vulkan-1.dll'
+$vulkan = Join-Path $repoRoot 'vendor\vulkan\vulkan-1.dll'
 foreach ($file in @((Join-Path $native 'avue-engine.exe'), (Join-Path $native 'libvideo2x.dll'), (Join-Path $ncnn 'bin\ncnn.dll'), (Join-Path $ffmpegCli 'bin\ffmpeg.exe'), (Join-Path $cugan 'realcugan-ncnn-vulkan.exe'), $vulkan)) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Required build input missing: $file" }
 }
+if ((Get-FileHash -LiteralPath $vulkan -Algorithm SHA256).Hash -ne '8644669401D2C080EA10CFEA2BA8A7C63D76E10A4E7AE8246837DF1DFD157EA8') { throw 'Bundled Vulkan loader SHA-256 mismatch.' }
 $engineDir = Join-Path $destination 'engine'
 $ffmpegDir = Join-Path $destination 'ffmpeg'
 $licenseDir = Join-Path $destination 'licenses'
@@ -45,6 +46,7 @@ The ffmpeg and ffprobe executables are the Gyan.dev 9.0.2 essentials build.
 FFmpeg 9.0.2 source: https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz
 ncnn 20240820: https://github.com/Tencent/ncnn/tree/20240820
 Vulkan Loader 1.3.296.0: https://github.com/KhronosGroup/Vulkan-Loader/tree/v1.3.296
+Bundled vulkan-1.dll SHA-256: 8644669401d2c080ea10cfea2ba8a7c63d76e10a4e7ae8246837df1dfd157ea8
 Real-CUGAN executable: https://github.com/nihui/realcugan-ncnn-vulkan/tree/20220728
 See LICENSE, NOTICE and runtime/licenses for license information.
 '@ | Set-Content -LiteralPath (Join-Path $destination 'PROVENANCE.txt') -Encoding utf8
