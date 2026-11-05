@@ -265,7 +265,11 @@ class CompareDialog(QDialog):
         }
         codec = self.encoder_choice.currentData()
         encoder = {} if codec == "current" else {"codec": codec, "preset": default_encoder_preset(codec), "extra_options": ""}
-        return replace(self.settings, **choices.get(choice, {}), **encoder,
+        selected = choices.get(choice, {})
+        engine = selected.get("engine", self.settings.engine)
+        model = selected.get("cugan_model", self.settings.cugan_model)
+        precision = self.settings.high_precision and engine in ("realesrgan", "libplacebo", "realcugan", "rife")
+        return replace(self.settings, **selected, **encoder, high_precision=precision,
                        quality=self.sample_quality.value(), recover_shutdown=self.recovery.isChecked(), resume_segments=False)
 
     def _sample_encoder_changed(self):
@@ -344,10 +348,14 @@ class CompareDialog(QDialog):
                        "-ss", f"{self.start_time.value():.3f}", "-i", str(self.source),
                        "-t", f"{self.length.value():.3f}", "-map", f"0:{self.media.video_index}",
                        "-an", "-sn", "-dn"]
-            if self.media.hdr:
+            if self.active_settings.high_precision:
+                command += ["-vf", f"setparams=color_primaries={self.media.color_primaries}:color_trc={self.media.color_transfer}:colorspace={self.media.color_space}:range={self.media.color_range}",
+                            "-color_primaries", self.media.color_primaries, "-color_trc", self.media.color_transfer,
+                            "-colorspace", self.media.color_space, "-color_range", self.media.color_range]
+            elif self.media.hdr:
                 from .pipeline import hdr_to_sdr_filters
                 command += ["-vf", ",".join(hdr_to_sdr_filters(self.media)), "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
-            command += ["-c:v", "ffv1", "-pix_fmt", "yuv444p",
+            command += ["-c:v", "ffv1", "-pix_fmt", "yuv420p10le" if self.active_settings.high_precision else "yuv444p",
                        "-fps_mode", "passthrough", str(self.clip)]
             process.finished.connect(self._clip_finished)
             process.errorOccurred.connect(self._clip_error)
@@ -458,7 +466,7 @@ class CompareDialog(QDialog):
                 size_range = f"{min(sizes):.0f}–{max(sizes):.0f}" if len(sizes) > 1 else f"{sizes[0]:.0f}"
                 entry += ("\n" + self.tr("Estimated full video from this sample (video only; approximate)")
                           + f": {time_range} min · {size_range} MiB · {self.tr('Samples')}: {len(observations)}")
-                entry += "\n" + self.tr("Range uses observed samples with identical settings; it is not a guarantee. Audio, subtitles and startup time are excluded.")
+                entry += "\n" + self.tr("Range uses samples with identical settings; it is not a guarantee. Audio, subtitles and preparation are excluded; sample startup can affect the time estimate.")
             self.sample_results.append(entry)
             self.results.setPlainText("\n".join(self.sample_results))
             self.playback_button.setEnabled(True)

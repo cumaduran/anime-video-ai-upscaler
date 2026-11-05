@@ -13,7 +13,7 @@ from PySide6.QtCore import QAbstractTableModel, QLibraryInfo, QModelIndex, QObje
 from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
-    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QMainWindow, QMenu, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter,
     QTableView, QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
 
@@ -73,6 +73,7 @@ LABELS = {
     "fps_multiplier":"FPS multiplier", "scene_threshold":"Scene threshold (%)", "rife_uhd":"RIFE UHD",
     "hwaccel":"Hardware decoder", "recover_shutdown":"Verify and recover a legacy engine shutdown crash", "target":"Output resolution", "width":"Target width", "height":"Target height",
     "resume_segments":"Resume using saved AI segments",
+    "high_precision":"High-precision AI (experimental)",
     "aspect":"Aspect ratio", "codec":"Video encoder", "quality":"Quality (CRF / CQ / QP)", "preset":"Encoder speed",
     "pixel_format":"Pixel format", "container":"Container", "audio":"Audio", "audio_bitrate":"AAC bitrate (bits/s)", "restoration":"Denoise before AI", "copy_subtitles":"Keep source subtitles",
     "subtitle_mode":"External subtitles", "subtitle_path":"Subtitle file", "subtitle_language":"Subtitle language", "watermark_path":"PNG watermark",
@@ -145,6 +146,24 @@ class SettingsStore(QObject):
 
     def update(self, key, value):
         values = {key:value}
+        # Editing an engine-specific control makes that processor active. This
+        # keeps controls usable and makes the effect of a click predictable.
+        engine = ({"model": "realesrgan", "shader": "libplacebo",
+                   "rife_model": "rife", "rife_uhd": "rife", "fps_multiplier": "rife",
+                   "scene_threshold": "rife"}.get(key) or
+                  ("realcugan" if key.startswith("cugan_") else None))
+        if engine:
+            values["engine"] = engine
+        elif key == "scale" and self.value.engine not in ("realesrgan", "realcugan", "libplacebo"):
+            values["engine"] = "realesrgan"
+        if key in ("width", "height"):
+            values["target"] = "custom"
+        elif key in ("watermark_x", "watermark_y"):
+            values["watermark_corner"] = "free"
+        elif key == "audio_bitrate":
+            values["audio"] = "aac"
+        elif key == "quality":
+            values["bit_rate"] = 0
         if key == "codec" and value != self.value.codec:
             values["preset"] = default_encoder_preset(value)
             values["quality"] = min(self.value.quality, quality_maximum(value))
@@ -201,6 +220,22 @@ class HelpDialog(QDialog):
         layout.addWidget(buttons)
 
 
+class FullWidthCheckBox(QCheckBox):
+    def hitButton(self, point):
+        return self.rect().contains(point)
+
+
+class EngineComboBox(QComboBox):
+    def __init__(self, activate=None):
+        super().__init__()
+        self.activate = activate
+
+    def showPopup(self):
+        if self.activate:
+            self.activate()
+        super().showPopup()
+
+
 class SettingsForm(QWidget):
     def __init__(self, store, keys, translate, parent=None):
         super().__init__(parent)
@@ -214,7 +249,9 @@ class SettingsForm(QWidget):
         for key in keys:
             value = getattr(store.value, key)
             if key in CHOICES or key == "preset":
-                control = QComboBox()
+                engine_for_choice = {"model": "realesrgan", "shader": "libplacebo", "cugan_model": "realcugan", "rife_model": "rife"}.get(key)
+                control = EngineComboBox(lambda engine=engine_for_choice: self.store.update("engine", engine)
+                                         if engine and self.store.value.engine != engine else None)
                 control.setMinimumContentsLength(10)
                 control.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
                 for item in CHOICES.get(key, ()):
@@ -224,7 +261,7 @@ class SettingsForm(QWidget):
                     control.addItem(self.tr(label), item)
                 control.currentIndexChanged.connect(lambda _, k=key, c=control: self.store.update(k, c.currentData()))
             elif isinstance(value, bool):
-                control = QCheckBox()
+                control = FullWidthCheckBox()
                 control.toggled.connect(lambda v, k=key: self.store.update(k, v))
             elif isinstance(value, int):
                 control = QSpinBox()
@@ -320,26 +357,7 @@ class SettingsForm(QWidget):
             else:
                 control.setText(value)
             control.blockSignals(False)
-            enabled = True
-            if key in ("width","height"):
-                enabled = s.target == "custom"
-            elif key == "model":
-                enabled = s.engine == "realesrgan"
-            elif key == "scale":
-                enabled = s.engine in ("realesrgan","realcugan","libplacebo")
-            elif key.startswith("cugan"):
-                enabled = s.engine == "realcugan"
-            elif key in ("rife_model","rife_uhd","fps_multiplier","scene_threshold"):
-                enabled = s.engine == "rife"
-            elif key == "shader":
-                enabled = s.engine == "libplacebo"
-            elif key in ("watermark_x", "watermark_y"):
-                enabled = s.watermark_corner == "free"
-            elif key == "audio_bitrate":
-                enabled = s.audio == "aac"
-            elif key == "quality":
-                enabled = s.bit_rate == 0
-            control.setEnabled(enabled)
+            control.setEnabled(True)
 
 
 def scroll(widget):
@@ -350,9 +368,10 @@ def scroll(widget):
 
 
 class QueueModel(QAbstractTableModel):
-    def __init__(self, runner, translate, parent=None):
+    def __init__(self, runner, translate, parent=None, checked_ids=None):
         super().__init__(parent)
         self.runner, self.tr = runner, translate
+        self.checked_ids = checked_ids if checked_ids is not None else set()
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.runner.jobs)
@@ -364,11 +383,36 @@ class QueueModel(QAbstractTableModel):
         if not index.isValid():
             return None
         job = self.runner.jobs[index.row()]
+        if role == Qt.ItemDataRole.CheckStateRole and index.column() == 0:
+            return Qt.CheckState.Checked if job.id in self.checked_ids else Qt.CheckState.Unchecked
         if role == Qt.ItemDataRole.DisplayRole:
             name = job.source.name + ("  ✦" if job.settings_locked else "")
             return (name, self.tr(job.state), f"{job.percent:.0f}%", job.output.name if job.output else "—")[index.column()]
         if role == Qt.ItemDataRole.ToolTipRole:
-            return job.error or str(job.source)
+            return self.tr(job.error) if job.error else str(job.source)
+
+    def flags(self, index):
+        flags = super().flags(index)
+        if index.isValid() and index.column() == 0:
+            flags |= Qt.ItemFlag.ItemIsUserCheckable
+        return flags
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        if not index.isValid() or index.column() != 0 or role != Qt.ItemDataRole.CheckStateRole:
+            return False
+        job_id = self.runner.jobs[index.row()].id
+        if value == Qt.CheckState.Checked or value == Qt.CheckState.Checked.value:
+            self.checked_ids.add(job_id)
+        else:
+            self.checked_ids.discard(job_id)
+        self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
+        return True
+
+    def check_jobs(self, jobs):
+        self.checked_ids.clear()
+        self.checked_ids.update(job.id for job in jobs)
+        if self.runner.jobs:
+            self.dataChanged.emit(self.index(0, 0), self.index(len(self.runner.jobs) - 1, 0), [Qt.ItemDataRole.CheckStateRole])
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
@@ -412,6 +456,7 @@ class MainWindow(QMainWindow):
         self.error_log_dialog = None
         self._startup_error = ""
         self._queue_error = ""
+        self._checked_job_ids = set()
         self._closing = False
         self._loading_editor = False
         self.sync_settings = True
@@ -543,11 +588,11 @@ class MainWindow(QMainWindow):
         warning.setWordWrap(True)
         warning.setObjectName("muted")
         finish_layout.addWidget(warning)
-        depth_warning = QLabel(self.tr("AI processing uses 8-bit RGB. A 10-bit export cannot restore precision lost in this stage."))
+        depth_warning = QLabel(self.tr("Standard AI processing uses 8-bit RGB. Experimental high-precision AI is available in advanced settings."))
         depth_warning.setWordWrap(True)
         depth_warning.setObjectName("muted")
         finish_layout.addWidget(depth_warning)
-        hdr_warning = QLabel(self.tr("HDR input is tone-mapped to SDR (BT.709); HDR highlights and metadata are not preserved."))
+        hdr_warning = QLabel(self.tr("HDR normally converts to SDR. High-precision AI keeps PQ/HLG; libx265 copies source HDR10 static metadata, but dynamic metadata is removed."))
         hdr_warning.setWordWrap(True)
         hdr_warning.setObjectName("muted")
         finish_layout.addWidget(hdr_warning)
@@ -577,6 +622,21 @@ class MainWindow(QMainWindow):
         queue_header.addStretch()
         right_layout.addLayout(queue_header)
         right_layout.addWidget(self.button("Add videos",self.add_dialog))
+        check_actions = QHBoxLayout()
+        select_button = QPushButton(self.tr("Check videos"))
+        select_button.setToolTip(self.tr("Check videos to remove them without changing the current selection."))
+        select_menu = QMenu(select_button)
+        for label, states in (("Check all", None), ("Check completed", {"done", "done_warning"}),
+                              ("Check failed", {"failed"}), ("Uncheck all", set())):
+            action = select_menu.addAction(self.tr(label))
+            action.triggered.connect(lambda checked=False, states=states: self.check_jobs(states))
+        select_button.setMenu(select_menu)
+        check_actions.addWidget(select_button)
+        clear_button = self.button("Clear list", self.clear_queue)
+        clear_button.setToolTip(self.tr("Remove all videos from the list. A video being processed is kept."))
+        check_actions.addWidget(clear_button)
+        right_layout.addLayout(check_actions)
+        right_layout.addWidget(self.button("Remove checked", self.remove_checked))
         queue_actions = QHBoxLayout()
         queue_actions.addWidget(self.button("Remove selected",self.remove_selected))
         queue_actions.addWidget(self.button("Retry selected",self.retry_selected))
@@ -598,7 +658,7 @@ class MainWindow(QMainWindow):
         queue_hint.setObjectName("muted")
         queue_hint.setWordWrap(True)
         right_layout.addWidget(queue_hint)
-        self.queue_model = QueueModel(self.runner,self.tr,self)
+        self.queue_model = QueueModel(self.runner,self.tr,self,self._checked_job_ids)
         self.table = DropTable()
         self.table.setModel(self.queue_model)
         self.table.files_dropped.connect(self.add_paths)
@@ -891,7 +951,7 @@ class MainWindow(QMainWindow):
             self.logs.appendPlainText(text)
 
     def error(self, error):
-        QMessageBox.warning(self,self.tr("Please check"),str(error))
+        QMessageBox.warning(self,self.tr("Please check"),self.tr(str(error)))
 
     def add_dialog(self):
         paths = QFileDialog.getOpenFileNames(self,self.tr("Add videos"),"","Videos (*.mp4 *.mkv *.mov *.avi *.webm *.m4v *.ts *.m2ts *.wmv)")[0]
@@ -924,9 +984,25 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda: self._add_paths_batch(paths, initial_settings))
 
     def remove_selected(self):
-        selected = {i.row() for i in self.table.selectionModel().selectedRows()}
+        selected = {self.runner.jobs[i.row()].id for i in self.table.selectionModel().selectedRows()}
+        self._remove_jobs(selected)
+
+    def check_jobs(self, states):
+        self.queue_model.check_jobs(job for job in self.runner.jobs if states is None or job.state in states)
+
+    def remove_checked(self):
+        self._remove_jobs(set(self._checked_job_ids))
+
+    def clear_queue(self):
+        self._remove_jobs({job.id for job in self.runner.jobs})
+
+    def _remove_jobs(self, job_ids):
+        removable = {job.id for job in self.runner.jobs if job.id in job_ids and job is not self.runner.current}
+        if not removable:
+            return
         self.queue_model.beginResetModel()
-        self.runner.jobs[:] = [j for i,j in enumerate(self.runner.jobs) if i not in selected or j is self.runner.current]
+        self.runner.jobs[:] = [job for job in self.runner.jobs if job.id not in removable]
+        self._checked_job_ids.difference_update(removable)
         self.queue_model.endResetModel()
         self._queue_timer.start(600)
         self.count_label.setText(f"{self.tr('Queue')} · {len(self.runner.jobs)}")
@@ -1035,8 +1111,11 @@ class MainWindow(QMainWindow):
             return
         from .preflight import check_media_queue
         from .pipeline import lossless_working_bytes, output_path
-        from .disk_policy import RESERVE_BYTES
+        from .disk_policy import RESERVE_BYTES, preflight_threshold
+        from .estimates import estimate
+        from .checkpoints import find_checkpoints
         import shutil
+        checkpoint_cache = {}
         for job in jobs:
             job.media_info = None
         problems = check_media_queue(self, jobs, probe, self.tr)
@@ -1062,8 +1141,33 @@ class MainWindow(QMainWindow):
                     reference = lossless_working_bytes(job.settings, media)
                     if reference:
                         lines.append(self.tr("Uncompressed working-data reference, not a disk-space prediction") + f": {reference / 1024**3:.1f} GiB")
+                    if job.settings.resume_segments:
+                        lines.append(self.tr("Resume mode stores lossless AI segments on the output drive and may require many gigabytes. The interrupted segment and final encoding must be repeated."))
+                        threshold = preflight_threshold(reference)
+                        lines.append(self.tr("Resume mode safety threshold, not a disk-space prediction") + f": {threshold / 1024**3:.1f} GiB")
+                        if free_bytes < threshold:
+                            lines.append(self.tr("Warning: free space is below the resume mode safety threshold."))
+                        if output.parent.is_dir():
+                            if output.parent not in checkpoint_cache:
+                                checkpoint_cache[output.parent] = find_checkpoints(output.parent)
+                            candidates = [item for item in checkpoint_cache[output.parent]
+                                          if item.path.name.startswith(f".anime-resume-{job.id}-")]
+                            if candidates:
+                                segments = sum(item.segments for item in candidates)
+                                size = sum(item.size for item in candidates) / 1024**3
+                                lines.append(self.tr("Possible saved checkpoints for this job") + f": {len(candidates)} · {self.tr('Saved segments')}: {segments} · {size:.2f} GiB")
+                                lines.append(self.tr("Settings and files are verified when retrying; older checkpoints may not be reusable. Use Manage recovery files to inspect or remove them."))
+                    observed = estimate(self.runner.completed_observations, job.settings, media)
+                    if observed:
+                        low_time, high_time, low_size, high_size, count = observed
+                        time_range = f"{low_time / 60:.1f}–{high_time / 60:.1f}" if count > 1 else f"{low_time / 60:.1f}"
+                        size_range = f"{low_size / 1024**2:.0f}–{high_size / 1024**2:.0f}" if count > 1 else f"{low_size / 1024**2:.0f}"
+                        lines.append(self.tr("Estimate from comparable completed jobs in this session") + f": {time_range} min · {size_range} MiB · {self.tr('Samples')}: {count}")
+                        lines.append(self.tr("Output size includes audio and subtitles. Different content and processing conditions may change these estimates."))
                     if media.hdr:
-                        lines.append(self.tr("HDR input is tone-mapped to SDR (BT.709); HDR highlights and metadata are not preserved."))
+                        message = ("Experimental HDR AI uses models trained for SDR. Colors and highlights may change. libx265 copies source HDR10 static metadata; dynamic metadata is removed. Compare a short sample before processing long videos."
+                                   if job.settings.high_precision else "HDR input is tone-mapped to SDR (BT.709); HDR highlights and metadata are not preserved.")
+                        lines.append(self.tr(message))
             except (OSError, ValueError) as error:
                 lines.append(str(error))
         if problems:
@@ -1226,7 +1330,7 @@ class MainWindow(QMainWindow):
         preset_row.addWidget(apply_preset)
         layout.addLayout(preset_row)
         tabs = QTabWidget()
-        groups = [("AI", ["engine","model","scale","gpu","noise","cugan_model","cugan_threads","cugan_syncgap","shader","rife_model","fps_multiplier","scene_threshold","rife_uhd","hwaccel","recover_shutdown","resume_segments"]),
+        groups = [("AI", ["engine","model","scale","gpu","high_precision","noise","cugan_model","cugan_threads","cugan_syncgap","shader","rife_model","fps_multiplier","scene_threshold","rife_uhd","hwaccel","recover_shutdown","resume_segments"]),
                   ("Encoder", ["codec","preset","quality","pixel_format","bit_rate","rc_buffer_size","rc_min_rate","rc_max_rate","qmin","qmax","gop_size","max_b_frames","keyint_min","refs","thread_count","extra_options"]),
                   ("Finishing", ["target","width","height","aspect","container","audio","audio_bitrate","restoration","copy_subtitles","subtitle_mode","subtitle_path","subtitle_language","watermark_path","watermark_corner","watermark_x","watermark_y","watermark_width","watermark_margin","watermark_opacity","flicker","output_dir"])]
         for label, keys in groups:
@@ -1337,11 +1441,17 @@ class MainWindow(QMainWindow):
                 if problems:
                     self.error(self.tr("Check these videos before starting:") + "\n\n" + "\n".join(problems[:30]) + (f"\n... +{len(problems) - 30}" if len(problems) > 30 else ""))
                     return
-                hdr_jobs = [job.source.name for job in jobs if job.source_hdr]
+                hdr_jobs = [job.source.name for job in jobs if job.source_hdr and not job.settings.high_precision]
                 if hdr_jobs:
                     message = self.tr("HDR input is tone-mapped to SDR (BT.709); HDR highlights and metadata are not preserved.")
                     message += "\n\n" + "\n".join(hdr_jobs[:20]) + (f"\n... +{len(hdr_jobs) - 20}" if len(hdr_jobs) > 20 else "")
                     if QMessageBox.question(self, self.tr("HDR to SDR"), message) != QMessageBox.StandardButton.Yes:
+                        return
+                hdr_high = [job.source.name for job in jobs if job.source_hdr and job.settings.high_precision]
+                if hdr_high:
+                    message = self.tr("Experimental HDR AI uses models trained for SDR. Colors and highlights may change. libx265 copies source HDR10 static metadata; dynamic metadata is removed. Compare a short sample before processing long videos.")
+                    message += "\n\n" + "\n".join(hdr_high[:20]) + (f"\n... +{len(hdr_high) - 20}" if len(hdr_high) > 20 else "")
+                    if QMessageBox.question(self, self.tr("Experimental HDR AI"), message) != QMessageBox.StandardButton.Yes:
                         return
             if not waiting:
                 # A deliberate Start click retries only the selected inactive jobs.
@@ -1378,7 +1488,7 @@ class MainWindow(QMainWindow):
                 self.error_log_dialog.set_contents(summary, content, path)
             self.error_log_dialog.show()
             self.error_log_dialog.raise_()
-        unknown = job.state in ("probe","subtitle_check","help","filters","encoders","encoder_check","normalize","assemble","verify","verify_ai")
+        unknown = job.state in ("probe","hdr_metadata_probe","verify_hdr_metadata","subtitle_check","help","filters","encoders","encoder_check","normalize","assemble","verify","verify_ai")
         self.progress.setRange(0,0 if unknown else 100)
         self.progress.setValue(int(job.percent))
         self._refresh_start_controls()
@@ -1473,7 +1583,7 @@ class MainWindow(QMainWindow):
         draft = SettingsStore(self.store.value,dialog)
         layout = QVBoxLayout(dialog)
         tabs = QTabWidget()
-        groups = [("AI",["engine","model","scale","gpu","noise","cugan_model","cugan_threads","cugan_syncgap","shader","rife_model","fps_multiplier","scene_threshold","rife_uhd","hwaccel","recover_shutdown","resume_segments"]),
+        groups = [("AI",["engine","model","scale","gpu","high_precision","noise","cugan_model","cugan_threads","cugan_syncgap","shader","rife_model","fps_multiplier","scene_threshold","rife_uhd","hwaccel","recover_shutdown","resume_segments"]),
                   ("Encoder",["codec","preset","quality","pixel_format","bit_rate","rc_buffer_size","rc_min_rate","rc_max_rate","qmin","qmax","gop_size","max_b_frames","keyint_min","refs","thread_count","extra_options"]),
                   ("Finishing",["target","width","height","aspect","container","audio","audio_bitrate","restoration","copy_subtitles","subtitle_mode","subtitle_path","subtitle_language","watermark_path","watermark_corner","watermark_x","watermark_y","watermark_width","watermark_margin","watermark_opacity","flicker","output_dir"])]
         for label, keys in groups:

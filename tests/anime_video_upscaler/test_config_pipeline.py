@@ -81,12 +81,120 @@ def test_input_stream_selection_and_safety_guards():
     validate_media(Settings(),replace(MEDIA,rotation=90))
 
 
+@pytest.mark.parametrize("average,nominal,expected", [
+    ("0/0", "24000/1001", 24000/1001),
+    ("24/1", "0/0", 24),
+    ("24/1", "24/1", 24),
+])
+def test_probe_missing_rate_does_not_falsely_indicate_vfr(average, nominal, expected):
+    media = Media.from_probe({"streams": [{"codec_type": "video", "index": 0, "width": 640,
+                                           "height": 480, "avg_frame_rate": average,
+                                           "r_frame_rate": nominal, "duration": "N/A"}],
+                              "format": {"duration": "12.5"}})
+    assert media.fps == pytest.approx(expected)
+    assert media.duration == 12.5
+    assert not media.variable_rate
+    if media.uncertain_frame_rate:
+        with pytest.raises(ValueError, match="metadata is incomplete"):
+            validate_media(Settings(), media)
+    else:
+        validate_media(Settings(), media)
+
+
+def test_probe_different_known_frame_rates_indicate_vfr():
+    media = Media.from_probe({"streams": [{"codec_type": "video", "index": 0, "width": 640,
+                                           "height": 480, "avg_frame_rate": "24/1",
+                                           "r_frame_rate": "30/1"}]})
+    with pytest.raises(ValueError, match="VFR"):
+        validate_media(Settings(), media)
+
+
 def test_bt2020_without_transfer_is_rejected():
     media = Media.from_probe({"streams": [{"codec_type": "video", "index": 0, "width": 96, "height": 64,
                                           "avg_frame_rate": "24/1", "r_frame_rate": "24/1", "color_space": "bt2020nc"}]})
     assert media.uncertain_hdr
     with pytest.raises(ValueError, match="transfer metadata"):
         validate_media(Settings(), media)
+
+
+def test_hdr_tone_mapping_keeps_ten_bit_for_direct_ten_bit_encoding():
+    media = replace(MEDIA, hdr=True)
+    direct = replace(Settings(), engine="none", pixel_format="yuv420p10le")
+    graph = video_filter_graph(direct, media, "0:v:0", None, "")
+    assert "format=yuv420p10le" in graph
+    assert "format=yuv420p," not in graph
+    preview = video_filter_graph(direct, media, "0:v:0", None, "", preview=True)
+    assert "format=yuv420p," in preview
+    eight_bit = video_filter_graph(replace(direct, pixel_format="yuv420p"), media, "0:v:0", None, "")
+    assert "format=yuv420p," in eight_bit
+
+
+def test_high_precision_requires_supported_configuration_and_color_tags():
+    settings = replace(Settings(), high_precision=True, pixel_format="yuv420p10le")
+    settings.validate()
+    replace(settings, resume_segments=True).validate()
+    replace(settings, engine="realcugan", cugan_model="models-nose", scale=2, noise=0).validate()
+    replace(settings, engine="realcugan", cugan_model="models-se", cugan_syncgap=0, scale=4, noise=0).validate()
+    replace(settings, engine="realcugan", cugan_model="models-pro", cugan_syncgap=0, scale=2, noise=0).validate()
+    replace(settings, engine="libplacebo").validate()
+    replace(settings, engine="rife", rife_model="rife-v4.26").validate()
+    replace(settings, engine="rife", rife_model="rife-v3.1").validate()
+    replace(settings, engine="rife", rife_model="rife-v3.1", rife_uhd=True).validate()
+    replace(settings, engine="rife", rife_model="rife-v4.26", rife_uhd=True).validate()
+    replace(settings, engine="realcugan").validate()
+    for invalid in (replace(settings, pixel_format="yuv420p"),):
+        with pytest.raises(ValueError, match="High-precision"):
+            invalid.validate()
+    with pytest.raises(ValueError, match="color and range metadata"):
+        validate_media(settings, MEDIA)
+    source = replace(MEDIA, hdr=True, color_primaries="bt2020", color_transfer="smpte2084",
+                     color_space="bt2020nc", color_range="tv")
+    validate_media(settings, source)
+    for finishing in (replace(settings, watermark_path="logo.png"), replace(settings, subtitle_mode="burn")):
+        validate_media(finishing, source)
+    graph = video_filter_graph(settings, source, "0:v:0", None, "")
+    assert "2020_ncl" in graph and "tonemap=" not in graph
+    command = final_command(settings, TOOLS, Path('source'), Path('pipe:0'), Path('out.mkv'), source)
+    assert command[command.index('-color_trc') + 1] == 'smpte2084'
+
+
+def test_validation_messages_explain_which_setting_to_change():
+    with pytest.raises(ValueError, match='Encoder.*libx265.*yuv420p10le.*hevc_nvenc.*p010le'):
+        replace(Settings(), high_precision=True, pixel_format='yuv420p').validate()
+    with pytest.raises(ValueError, match='Finishing.*Denoise before AI.*Denoise level is a separate setting'):
+        replace(Settings(), resume_segments=True, restoration='mild').validate()
+
+
+def test_high_precision_output_validation_rejects_wrong_depth_or_color():
+    from anime_video_upscaler.pipeline import validate_output_streams
+    settings = replace(Settings(), high_precision=True, pixel_format="yuv420p10le", copy_subtitles=False)
+    video = {'codec_type': 'video', 'pix_fmt': 'yuv420p10le', 'color_primaries': 'bt2020',
+             'color_transfer': 'smpte2084', 'color_space': 'bt2020nc'}
+    validate_output_streams(settings, {'streams': [video]}, {'streams': [video]}, False)
+    for changed in ({**video, 'pix_fmt': 'yuv420p'}, {**video, 'color_transfer': 'bt709'}):
+        with pytest.raises(ValueError, match='bit depth verification'):
+            validate_output_streams(settings, {'streams': [video]}, {'streams': [changed]}, False)
+
+
+def test_hdr_static_metadata_is_translated_into_x265_options():
+    from anime_video_upscaler.pipeline import encoder_options
+    side = {'frames': [{'side_data_list': [
+        {'side_data_type': 'Mastering display metadata', 'red_x': '34000/50000', 'red_y': '16000/50000',
+         'green_x': '13250/50000', 'green_y': '34500/50000', 'blue_x': '7500/50000', 'blue_y': '3000/50000',
+         'white_point_x': '15635/50000', 'white_point_y': '16450/50000', 'min_luminance': '1/10000',
+         'max_luminance': '10000000/10000'},
+        {'side_data_type': 'Content light level metadata', 'max_content': 1000, 'max_average': 400}]}]}
+    media = replace(MEDIA, hdr=True).with_hdr_side_data(side)
+    settings = replace(Settings(), high_precision=True, pixel_format='yuv420p10le', codec='libx265',
+                       extra_options='x265-params=aq-mode=3')
+    cmd = encoder_options(settings, media)
+    value = cmd[cmd.index('-x265-params') + 1]
+    assert value == 'aq-mode=3:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400'
+    with pytest.raises(ValueError, match='Remove master-display'):
+        encoder_options(replace(settings, extra_options='x265-params=max-cll=1,1'), media)
+    with pytest.raises(ValueError, match='Invalid source HDR'):
+        replace(MEDIA, hdr=True).with_hdr_side_data({'frames': [{'side_data_list': [
+            {'side_data_type': 'Content light level metadata', 'max_content': -1, 'max_average': 400}]}]})
 
 
 def test_ai_legacy_and_current_capabilities():

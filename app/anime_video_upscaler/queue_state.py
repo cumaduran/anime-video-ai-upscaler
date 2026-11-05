@@ -9,7 +9,7 @@ from .config import Settings, atomic_json
 from .runner import Job
 
 TERMINAL = {"queued", "interrupted", "done", "done_warning", "failed", "cancelled"}
-ACTIVE = {"stream", "probe", "subtitle_check", "help", "filters", "encoders", "encoder_check", "normalize", "ai", "ai_frames", "assemble", "verify_ai", "encode", "verify", "verify_source_timing", "resume_count", "resume_decode", "resume_ai", "resume_trim", "resume_verify_new", "resume_verify_existing", "resume_concat"}
+ACTIVE = {"stream", "probe", "hdr_metadata_probe", "verify_hdr_metadata", "subtitle_check", "help", "filters", "encoders", "encoder_check", "normalize", "ai", "ai_frames", "assemble", "verify_ai", "encode", "verify", "verify_source_timing", "resume_count", "resume_decode", "resume_ai", "resume_trim", "resume_verify_new", "resume_verify_existing", "resume_concat"}
 
 
 def save_queue(path: Path, jobs: list[Job]) -> None:

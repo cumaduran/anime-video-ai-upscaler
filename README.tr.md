@@ -42,6 +42,14 @@ değildir; bazı uyumluluk kontrolleri işlem sırasında yapılır. **Kurtarma 
 yönet**, seçtiğin çıktı klasöründeki tanınan kayıtları ve kapladıkları alanı gösterir;
 seçili kayıtları silmeden önce onay ister.
 
+Kaydedilmiş AI parçalarıyla devam seçeneği açıksa hazırlık raporu, bu parçaların
+çok fazla disk alanı kullanabileceğini ve işlemde uygulanan güvenlik eşiğini de
+gösterir. Bu eşik gerçek disk ihtiyacını tahmin etmez veya yeterli alanı garanti etmez.
+Raporda bu işe ait olası kurtarma kayıtları da listelenir; yeniden kullanım ancak
+ayarlar ve dosyalar işlem sırasında doğrulandığında kesinleşir. Aynı oturumda
+benzer ayar ve video özellikleriyle tamamlanan işler varsa süre ve son dosya boyutu
+için yaklaşık bir aralık gösterilir; içerik ve koşullar sonucu değiştirebilir.
+
 **Donanım uyumluluğu** bölümünde Vulkan aygıtlarını listeleyebilir ve seçili GPU
 kodlayıcıyı deneyebilirsin. Aygıtın listelenmesi AI işleminin başarılı olacağını
 garantilemez. Video seçilmemişse kodlayıcı denemesi küçük bir 256 × 256 örnek kullanır.
@@ -224,9 +232,16 @@ kurtarılabilir motor kapanış hatası sayılmaz. Tamamlanan çıktı sessizce 
   bağlı kurtarma kullanır. Diğer sürücü ve uzun videolar ek test gerektirir.
 - **Real-CUGAN:** kaynak derlemeli akış, mevcut ağırlıkları ve seçilen döşeme
   eşzamanlamasını kullanır. Eski motorlar için paketli referans yol PNG kareleri
-  ve daha fazla disk kullanır.
-- **Medya:** AI 8 bit RGB işler. PQ/HLG HDR kaynaklar BT.709 SDR'ye dönüştürülür;
-  HDR parlaklık aralığı korunmaz. Eksik renk bilgisi olan BT.2020 kaynaklar
+  ve daha fazla disk kullanır. Güncel motor `models-pro` için gerekli aralık
+  dönüşümünü standart ve yüksek hassasiyetli yollarda uygular. Pro modelinde
+  3 eşzamanlama seçeneği kararlılık için 2 modunu kullanır; çok dar ve döşemeli
+  karelerde de 3 yerine 2 uygulanır. Eski referans motor Pro 2× için hâlâ siyah
+  kare üretebilir.
+- **Medya:** Standart AI yolu 8 bit RGB işler ve PQ/HLG HDR kaynakları BT.709
+  SDR'ye dönüştürür. Deneysel yüksek hassasiyetli AI yolu ve sınırları
+  aşağıda anlatılır. AI kapalıyken 10 bit 4:2:0 çıktı seçilirse
+  ton eşleme sonrasında zorunlu 8 bit ara biçim kullanılmaz; diğer filtre ve
+  kodlayıcıların kendi sınırları olabilir. Eksik renk bilgisi olan BT.2020 kaynaklar
   reddedilir. 90 derecelik katlarla döndürülmüş kaynaklar düzeltilir. Bazı
   değişken kare hızı, renk, altyazı ve uzun video durumları ek test gerektirir.
   Titreme azaltma flaşları ve sahne geçişlerini etkileyebilir; çizgi ve hareket sorunlarını tamamen gidermez.
@@ -235,6 +250,27 @@ kurtarılabilir motor kapanış hatası sayılmaz. Tamamlanan çıktı sessizce 
 - **Kendi modelimiz:** CMD2X/CMD4X araştırma adlarıdır; **eğitilmiş veya kullanıma
   sunulmuş model değildir**. [AI yol haritası](docs/ai-development-roadmap.md) ve
   [veri kümesi rehberi](docs/cmd-dataset-guide.md) sonraki adımları açıklar.
+
+### Deneysel 10 bit ve HDR AI
+
+**Gelişmiş ayarlar → AI** bölümünde **Yüksek hassasiyetli AI** seçeneğini
+açın; **Kodlayıcı** bölümünde 10 bit destekleyen bir kodlayıcı ve `yuv420p10le`
+veya uyumlu donanımda `p010le` seçin. Kaynakta BT.709 veya BT.2020 PQ/HLG renk
+bilgileri ve tam/sınırlı aralık bilgisi açıkça etiketlenmiş olmalıdır. Real-ESRGAN, Anime4K,
+Real-CUGAN ve UHD dâhil RIFE modelleri desteklenir. Eski RIFE modellerinde UHD hareketi düşük boyutta işler; v4 tam çözünürlüklü yolu kullanır ve bellek tüketimi azalmaz. Real-CUGAN `models-nose`
+eşzamanlama aralığını otomatik 0 kullanır; diğer modellerde 0 seçildiğinde döşeme
+sınırları görünebilir. Pro modellerinde 3 modu kararlılık için 2 olarak çalışır. Kayıtlı parçalarla devam
+kayıpsız 16 bit parçalar oluşturur ve çok disk alanı gerektirebilir; devam modu için
+gürültü giderme kapalı olmalıdır. Gürültü ve titreme filtreleri görüntüyü
+değiştirebilir. HDR filigran ve görüntüye işlenmiş altyazı SDR beyazını nominal
+100 nit referansla dönüştürür; HLG parlaklığı ekranın özelliklerine de bağlıdır.
+
+Bu yol AI giriş ve çıkışında 8 bite düşmez ve HDR kaynakta PQ/HLG renk etiketlerini
+korur. Modeller SDR için eğitildiğinden HDR'de renk ve parlaklık değişebilir;
+libx265 seçildiğinde kaynak HDR10 mastering ve içerik parlaklığı üst verileri kopyalanıp doğrulanır; bunlar değişen görüntünün parlaklığını yeniden hesaplamaz. Diğer kodlayıcılarda sabit HDR üst verileri ve tüm kodlayıcılarda dinamik HDR/Dolby Vision bilgileri korunmaz. İşlem daha yavaş olabilir. Önce
+kısa örneği ve sonucu uygun bir HDR ekranda inceleyin. Eski RIFE modelleri yalnız
+orta kare ürettiği için diğer ara zamanlarda tekrarlı hesaplama kullanır; bu işlem
+daha yavaştır ve tam orta kareye denk gelmeyen zamanlar yaklaşık hesaplanır.
 
 [Uygulama incelemesi](docs/application-review.md), geliştirme önceliklerini ve
 test açıklarını anlatır. Her kaynak için en iyi tek model veya tek ön ayar yoktur.

@@ -8,7 +8,7 @@ if (Test-Path -LiteralPath $output) { throw "Build output already exists: $outpu
 $runtime = if ($RuntimeRoot) { [IO.Path]::GetFullPath($RuntimeRoot) } else { Join-Path $repoRoot 'runtime' }
 if (-not $runtime.StartsWith($repoRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Runtime must be inside the project.' }
 $nativeBuild = Join-Path $repoRoot 'build\native-independent'
-foreach ($name in @('avue-engine.exe','libvideo2x.dll')) {
+foreach ($name in @('avue-engine.exe','libvideo2x.dll','librealesrgan-ncnn-vulkan.dll','librealcugan-ncnn-vulkan.dll','librife-ncnn-vulkan.dll')) {
     if (-not (Test-Path -LiteralPath (Join-Path $nativeBuild $name) -PathType Leaf)) { throw "Build the fixed native engine first: $name" }
 }
 
@@ -66,8 +66,9 @@ foreach ($name in @('video2x.exe','avue-engine-test.exe','avue-realesrgan.exe'))
     $staged = Join-Path $bundledEngine $name
     if (Test-Path -LiteralPath $staged -PathType Leaf) { Remove-Item -LiteralPath $staged }
 }
-Copy-Item -LiteralPath (Join-Path $nativeBuild 'avue-engine.exe') -Destination (Join-Path $bundledEngine 'avue-engine.exe') -Force
-Copy-Item -LiteralPath (Join-Path $nativeBuild 'libvideo2x.dll') -Destination (Join-Path $bundledEngine 'libvideo2x.dll') -Force
+foreach ($name in @('avue-engine.exe','libvideo2x.dll','librealesrgan-ncnn-vulkan.dll','librealcugan-ncnn-vulkan.dll','librife-ncnn-vulkan.dll')) {
+    Copy-Item -LiteralPath (Join-Path $nativeBuild $name) -Destination (Join-Path $bundledEngine $name) -Force
+}
 # The native process is standalone and cannot rely on another application's VC runtime.
 foreach ($name in @('msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll')) {
     $source = Join-Path $qtRoot $name

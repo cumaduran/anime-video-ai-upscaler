@@ -105,6 +105,24 @@ int InterpolatorRIFE::interpolate(
 ) {
     int ret;
 
+    if (prev_frame->format == AV_PIX_FMT_GBRP16LE && in_frame->format == AV_PIX_FMT_GBRP16LE &&
+        out_pix_fmt_ == AV_PIX_FMT_GBRP16LE) {
+        ncnn::Mat input0 = conversions::gbrp16_to_ncnn_float(prev_frame);
+        ncnn::Mat input1 = conversions::gbrp16_to_ncnn_float(in_frame);
+        if (input0.empty() || input1.empty()) return AVERROR(ENOMEM);
+        ncnn::Mat output(input0.w, input0.h, 3, (size_t)4u);
+        if (output.empty()) return AVERROR(ENOMEM);
+        ret = model_name_.find(STR("rife-v4")) != fsutils::StringType::npos
+            ? rife_->process_v4_float(input0, input1, time_step, output)
+            : rife_->process_legacy_float(input0, input1, time_step, output);
+        if (ret != 0) return ret;
+        *out_frame = conversions::ncnn_float_to_gbrp16(output);
+        if (!*out_frame) return AVERROR(ENOMEM);
+        av_frame_copy_props(*out_frame, in_frame);
+        (*out_frame)->pts = av_rescale_q(in_frame->pts, in_time_base_, out_time_base_);
+        return 0;
+    }
+
     ncnn::Mat in_mat1 = conversions::avframe_to_ncnn_mat(prev_frame);
     if (in_mat1.empty()) {
         logger()->error("Failed to convert AVFrame to ncnn::Mat");

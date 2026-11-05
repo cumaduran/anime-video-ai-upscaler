@@ -68,7 +68,7 @@ def check_media_queue(parent, jobs, ffprobe, tr):
             job.source_hdr = media.hdr
             job.media_info = media
         except (ValueError, KeyError, TypeError, UnicodeError) as error:
-            errors.append(f"{job.source.name}: {error}")
+            errors.append(f"{job.source.name}: {tr(str(error))}")
         state["index"] += 1
         QTimer.singleShot(0, next_job)
 

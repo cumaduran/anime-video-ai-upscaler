@@ -1,6 +1,9 @@
 """User-facing, reviewed explanations of every setting in English and Turkish."""
 
 HELP = {
+    "high_precision": (
+        "Experimental high-precision processing supports Real-ESRGAN, Anime4K, Real-CUGAN with synchronization and RIFE including UHD. Choose 10-bit 4:2:0 output and explicitly tagged BT.709 or BT.2020 PQ/HLG input. HDR subtitles and watermarks use a nominal 100-nit SDR white; HLG display brightness varies. Real-CUGAN with sync gap 0 may show tile seams. Resume stores large lossless 16-bit segments and requires denoise off. HDR colors and highlights may change; libx265 copies source mastering and content-light metadata, while dynamic HDR metadata is removed. Compare a short sample.",
+        "Deneysel yüksek hassasiyetli işlem; Real-ESRGAN, Anime4K, eşzamanlamalı Real-CUGAN ve UHD dâhil RIFE destekler. 10 bit 4:2:0 çıktı ve renkleri açıkça etiketlenmiş BT.709 veya BT.2020 PQ/HLG kaynak seçin. HDR altyazı ve filigranda nominal 100 nit SDR beyazı kullanılır; HLG parlaklığı ekrana göre değişir. Real-CUGAN eşzamanlama aralığı 0 olduğunda döşeme çizgileri oluşabilir. Devam modu büyük kayıpsız 16 bit parçalar saklar ve gürültü giderme kapalı olmalıdır. HDR renkleri ve parlaklık değişebilir; libx265 kaynak mastering ve içerik parlaklığı bilgilerini kopyalar, dinamik HDR bilgileri kaldırılır. Kısa örneği karşılaştırın."),
     "subtitle_language": ("Language tag for the selectable external subtitle track. Burned subtitles have no language tag.", "Seçilebilir harici altyazı izinin dil etiketidir. Görüntüye işlenen altyazının dil etiketi olmaz."),
     "engine": (
         "Choose the processor. Real-ESRGAN and Real-CUGAN enlarge with AI; Anime4K uses a shader; RIFE increases frame rate, not detail. Resize / encode only skips AI. Start with Real-ESRGAN for anime.",
@@ -18,17 +21,17 @@ HELP = {
         "Real-CUGAN denoise strength: -1 conservative, 0 no denoise, 1–3 progressively stronger where the selected model supports them. Higher values can erase grain and fine lines. Start at 0. Real-ESRGAN general-v3 uses a denoising variant when positive.",
         "Real-CUGAN gürültü giderme düzeyi: -1 korumacı, 0 gürültü giderme yok, 1–3 modelin desteklediği ölçüde giderek daha güçlüdür. Yüksek değer gren ve ince çizgileri silebilir. 0 ile başlayın. Real-ESRGAN general-v3 pozitif değerde gürültü azaltan varyantı kullanır."),
     "cugan_model": (
-        "Real-CUGAN model family. models-se is the balanced default, models-pro has stricter scale/noise combinations, and models-nose requires 2× and noise 0. Compare results on a representative clip.",
-        "Real-CUGAN model ailesidir. models-se dengeli varsayılandır, models-pro ölçek/gürültü birleşimlerini daha fazla sınırlar, models-nose ise 2× ölçek ve 0 gürültü düzeyi ister. Örnek bir kesitte sonuçları karşılaştırın."),
+        "Real-CUGAN model family. models-se is the balanced default; models-pro has stricter scale/noise combinations; its required range conversion is applied by the updated engine. For stability, Pro mode 3 uses mode 2 synchronization. models-nose requires 2× and noise 0. Compare a representative clip.",
+        "Real-CUGAN model ailesidir. models-se dengeli varsayılandır; models-pro ölçek/gürültü birleşimlerini sınırlar; güncel motor gerekli aralık dönüşümünü uygular. Kararlılık için Pro modelinde 3 modu yerine 2 eşzamanlama modu kullanılır. models-nose 2× ve gürültü 0 gerektirir. Örnek bir kesitte sonucu kontrol edin."),
     "cugan_threads": (
         "Real-CUGAN worker threads, 1–256. Default 1. More threads can increase CPU and memory use and do not always make GPU processing faster; increase only after measuring.",
         "Real-CUGAN iş parçacığı sayısı, 1–256. Varsayılan 1'dir. Artırmak CPU/bellek kullanımını yükseltebilir ve GPU işlemini her zaman hızlandırmaz; ölçerek artırın."),
     "cugan_syncgap": (
-        "Real-CUGAN synchronization mode: 0 no sync, 1 accurate, 2 rough, 3 very rough. Default 3. Mode 1 uses accurate tiled synchronization and can be slower; compare results on a representative clip. The bundled reference backend applies this setting; legacy engines may ignore it.",
-        "Real-CUGAN eşzamanlama modu: 0 yok, 1 hassas, 2 kaba, 3 çok kaba. Varsayılan 3'tür. 1 modu döşemeler arasında hassas eşzamanlama kullanır ve daha yavaş olabilir; örnek görüntüde karşılaştırın. Paketli referans motor bu ayarı uygular; eski motorlar yok sayabilir."),
+        "Real-CUGAN synchronization mode: 0 no sync, 1 accurate, 2 rough, 3 very rough. Default 3. Mode 1 uses accurate tiled synchronization and can be slower; compare results on a representative clip. For Pro models and very narrow tiled frames, mode 3 uses mode 2 for stability. Legacy engines may ignore this setting.",
+        "Real-CUGAN eşzamanlama modu: 0 yok, 1 hassas, 2 kaba, 3 çok kaba. Varsayılan 3'tür. 1 modu döşemeler arasında hassas eşzamanlama kullanır ve daha yavaş olabilir; örnek görüntüde karşılaştırın. Pro modellerinde ve çok dar döşemeli karelerde kararlılık için 3 yerine 2 modu kullanılır. Eski motorlar ayarı yok sayabilir."),
     "shader": (
-        "Anime4K shader profile. A, B and C variants differ in reconstruction strength and cost; +a/+b combine passes, and GAN is heavier. Start with anime4k-v4-a and compare line detail, ringing and speed.",
-        "Anime4K gölgelendirici profilidir. A, B ve C çeşitlerinin yeniden oluşturma gücü ve maliyeti farklıdır; +a/+b geçişleri birleştirir, GAN daha ağırdır. anime4k-v4-a ile başlayıp çizgileri, çınlamayı ve hızı karşılaştırın."),
+        "Anime4K shader profile. Opening this selector activates the Anime4K engine. A, B and C variants differ in reconstruction strength and cost; +a/+b combine passes, and GAN is heavier. Start with anime4k-v4-a and compare line detail, ringing and speed.",
+        "Anime4K gölgelendirici profilidir. Bu seçiciyi açmak Anime4K işlemcisini etkinleştirir. A, B ve C çeşitlerinin yeniden oluşturma gücü ve maliyeti farklıdır; +a/+b geçişleri birleştirir, GAN daha ağırdır. anime4k-v4-a ile başlayıp çizgileri, çınlamayı ve hızı karşılaştırın."),
     "rife_model": (
         "RIFE frame-interpolation model. Newer versions may need more GPU resources and can produce different artifacts. v4.26 is the starting choice if installed; compare difficult motion and scene changes.",
         "RIFE kare ara değeri modelidir. Yeni sürümler daha fazla GPU kaynağı isteyebilir ve farklı hatalar üretebilir. Kuruluysa v4.26 başlangıç seçeneğidir; hızlı hareketleri ve sahne değişimlerini karşılaştırın."),
@@ -39,8 +42,8 @@ HELP = {
         "RIFE scene-change threshold, 0–100%. Lower values treat more changes as cuts and skip interpolation across them; higher values interpolate more aggressively. Start around 20 and check cuts and flashes.",
         "RIFE sahne değişimi eşiği, %0–100. Düşük değer daha çok değişimi kesme sayıp aralarında kare üretmez; yüksek değer daha fazla ara kare üretir. Yaklaşık 20 ile başlayıp kesmeleri ve parlamaları kontrol edin."),
     "rife_uhd": (
-        "RIFE UHD mode for large input frames. It changes the interpolation processing strategy and resource use, not the requested final resolution. Leave off unless UHD input needs it and test quality.",
-        "Büyük giriş kareleri için RIFE UHD modudur. Son çözünürlüğü değil ara kare işlem yöntemini ve kaynak kullanımını değiştirir. UHD girişte gerekmedikçe kapalı tutun ve kaliteyi kontrol edin."),
+        "RIFE UHD mode for large input frames. Changing this option activates the RIFE engine. Older models process motion at reduced size; v4 uses its normal full-resolution model and does not reduce GPU memory use. Test quality on a short sample.",
+        "Büyük giriş kareleri için RIFE UHD modudur. Bu seçeneği değiştirmek RIFE işlemcisini etkinleştirir. Eski modeller hareketi daha düşük boyutta işler; v4 normal tam çözünürlüklü modelini kullanır ve GPU bellek kullanımı azalmaz. Kaliteyi kısa bir örnekte kontrol edin."),
     "hwaccel": (
         "Hardware decoding mode for the Video2X stage. none uses software decoding; cuda, d3d11va, dxva2, vulkan and qsv depend on the installed build and hardware. Start with none; it does not disable GPU AI or NVENC.",
         "Video2X aşamasının donanımla çözme yöntemi. none yazılımla çözer; cuda, d3d11va, dxva2, vulkan ve qsv kurulu sürüme ve donanıma bağlıdır. none ile başlayın; GPU AI veya NVENC'i kapatmaz."),
@@ -48,8 +51,8 @@ HELP = {
         "Off by default. For the observed old Video2X shutdown crash only: after a reported success and matching frame count, decode and verify the full intermediate before continuing. Completion remains a warning; visual correctness is not guaranteed.",
         "Varsayılan kapalıdır. Yalnız görülen eski Video2X kapanış hatasında, başarı bildirimi ve kare sayısı eşleşirse devam etmeden önce ara videonun tamamını çözüp doğrular. Sonuç uyarılı kalır; görüntü doğruluğu garanti değildir."),
     "resume_segments": (
-        "Save verified one-minute AI segments so a retry can reuse completed work. Supports Real-ESRGAN, Real-CUGAN with the bundled engine, Anime4K and RIFE; denoise must be off. Requires substantial extra free space. The current segment and final encoding restart after interruption.",
-        "Doğrulanmış bir dakikalık AI parçalarını kaydeder; yeniden denemede tamamlanan parçalar kullanılır. Real-ESRGAN, paketli motorla Real-CUGAN, Anime4K ve RIFE desteklenir; gürültü giderme kapalı olmalıdır. Çok fazla ek boş alan gerektirir. Kesilen parça ve son kodlama yeniden başlar."),
+        "Save verified one-minute AI segments so a retry can reuse completed work. Supports Real-ESRGAN, Real-CUGAN, Anime4K and RIFE. Set Finishing → Denoise before AI to Off; Denoise level under AI is a different setting. Requires substantial extra free space. The current segment and final encoding restart after interruption.",
+        "Doğrulanmış bir dakikalık AI parçalarını kaydeder; yeniden denemede tamamlanan parçalar kullanılır. Real-ESRGAN, Real-CUGAN, Anime4K ve RIFE desteklenir. Son İşlemler → AI öncesi gürültü giderme seçeneğini Kapalı yapın; AI bölümündeki Gürültü giderme düzeyi ayrı bir ayardır. Çok fazla ek boş alan gerektirir. Kesilen parça ve son kodlama yeniden başlar."),
     "target": (
         "Final canvas: 4K UHD = 3840×2160, QHD = 2560×1440, AI output size keeps the processed size, Custom uses your width/height. The AI scale remains a separate setting.",
         "Son çıktı alanı: 4K UHD = 3840×2160, QHD = 2560×1440, AI çıktı boyutu işlenmiş boyutu korur; Özel genişlik/yüksekliği kullanır. AI büyütme oranı ayrı bir ayardır."),
@@ -72,8 +75,8 @@ HELP = {
         "Encoder speed/efficiency, not the saved system preset. CPU slow uses more time than fast; NVENC p1 is fastest and p7 slowest. AMD AMF offers speed, balanced, quality and high_quality; support depends on hardware and drivers.",
         "Kodlama hızı/verimidir; sistem ön ayarı değildir. CPU'da slow fast'ten yavaştır; NVENC p1 en hızlı, p7 en yavaştır. AMD AMF speed, balanced, quality ve high_quality sunar; destek donanım ve sürücüye bağlıdır."),
     "pixel_format": (
-        "Pixel format and bit depth. yuv420p is widely compatible; yuv420p10le/p010le require a compatible encoder/player; 4:4:4 is less widely supported. AI intermediates use 8-bit RGB, so 10-bit output cannot restore lost precision.",
-        "Piksel biçimi ve bit derinliğidir. yuv420p yaygın uyumludur; yuv420p10le/p010le uyumlu kodlayıcı/oynatıcı ister; 4:4:4 desteği daha sınırlıdır. AI ara dosyaları 8 bit RGB'dir; 10 bit çıktı kaybolan hassasiyeti geri getirmez."),
+        "Pixel format and bit depth. yuv420p is widely compatible; yuv420p10le/p010le require a compatible encoder/player; 4:4:4 is less widely supported. Standard AI uses 8-bit RGB; supported experimental high-precision paths are an exception.",
+        "Piksel biçimi ve bit derinliğidir. yuv420p yaygın uyumludur; yuv420p10le/p010le uyumlu kodlayıcı/oynatıcı ister; 4:4:4 desteği daha sınırlıdır. Standart AI yolu 8 bit RGB kullanır; desteklenen deneysel yüksek hassasiyetli yollar istisnadır."),
     "container": (
         "MKV supports many subtitle/audio formats and is a flexible anime default. MP4 has broad device support, but bitmap subtitles cannot be copied and soft text subtitles become mov_text, which can lose ASS styling.",
         "MKV birçok altyazı/ses biçimini destekler ve anime için esnek varsayılandır. MP4 geniş aygıt desteği sunar; ancak resim tabanlı altyazılar kopyalanamaz, seçilebilir metin altyazısı mov_text olur ve ASS stilleri kaybolabilir."),

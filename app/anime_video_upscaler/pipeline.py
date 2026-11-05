@@ -1,7 +1,7 @@
 """Pure workflow planning; no shell commands and no model modifications."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 import math
 import os
@@ -26,6 +26,51 @@ class Media:
     video_start_offset: float = 0.0
     audio_codecs: tuple[str, ...] = ()
     uncertain_hdr: bool = False
+    uncertain_frame_rate: bool = False
+    color_primaries: str = "unknown"
+    color_transfer: str = "unknown"
+    color_space: str = "unknown"
+    color_range: str = "unknown"
+    hdr_master_display: str = ""
+    hdr_content_light: str = ""
+
+    def with_hdr_side_data(self, data: dict) -> Media:
+        """Read static HDR10 metadata from the decoded first video frame."""
+        frames = data.get("frames", [])
+        if not frames:
+            raise ValueError("Could not read a video frame to inspect HDR metadata")
+        master = light = ""
+        for item in (item for frame in frames for item in frame.get("side_data_list", [])):
+            kind = item.get("side_data_type", "").lower()
+            try:
+                if kind == "mastering display metadata":
+                    def scaled(key, unit, maximum):
+                        value = Fraction(str(item[key]))
+                        if not 0 <= value <= maximum:
+                            raise ValueError("HDR metadata value out of range")
+                        return round(value * unit)
+                    xy = lambda color: (scaled(color + "_x", 50000, 1), scaled(color + "_y", 50000, 1))
+                    green, blue, red, white = (xy(name) for name in ("green", "blue", "red", "white_point"))
+                    low = scaled("min_luminance", 10000, 10000)
+                    high = scaled("max_luminance", 10000, 10000)
+                    if low > high:
+                        raise ValueError("Invalid HDR mastering luminance")
+                    value = (f"G({green[0]},{green[1]})B({blue[0]},{blue[1]})R({red[0]},{red[1]})"
+                             f"WP({white[0]},{white[1]})L({high},{low})")
+                    if master and master != value:
+                        raise ValueError("HDR mastering metadata changes within the input")
+                    master = value
+                elif kind == "content light level metadata":
+                    maximum, average = int(item["max_content"]), int(item["max_average"])
+                    if not (0 <= maximum <= 65535 and 0 <= average <= 65535):
+                        raise ValueError("HDR content light value out of range")
+                    value = f"{maximum},{average}"
+                    if light and light != value:
+                        raise ValueError("HDR content-light metadata changes within the input")
+                    light = value
+            except (KeyError, TypeError, ValueError, ZeroDivisionError, OverflowError) as error:
+                raise ValueError("Invalid source HDR static metadata; output was not written") from error
+        return replace(self, hdr_master_display=master, hdr_content_light=light)
 
     @classmethod
     def from_probe(cls, data: dict) -> Media:
@@ -38,7 +83,9 @@ class Media:
                 return result if math.isfinite(result) and result > 0 else fallback
             except (ValueError, ZeroDivisionError):
                 return fallback
-        duration = ratio(video.get("duration", data.get("format", {}).get("duration", 0)), 0.0)
+        duration = ratio(video.get("duration"), ratio(data.get("format", {}).get("duration"), 0.0))
+        avg_fps = ratio(video.get("avg_frame_rate"), 0.0)
+        nominal_fps = ratio(video.get("r_frame_rate"), 0.0)
         # ffmpeg resets each input against its own container start time. Preserve
         # the source video's relative offset when AI uses a separate intermediate.
         video_start_offset = 0.0
@@ -57,15 +104,18 @@ class Media:
         if rotation % 180 == 90:
             width, height, sar = height, width, 1 / sar
         media = cls(width, height, duration,
-                    ratio(video.get("avg_frame_rate"), ratio(video.get("r_frame_rate"), 0)),
+                    avg_fps or nominal_fps,
                     sar, int(video["index"]),
                     tuple(s.get("codec_name", "unknown") for s in data.get("streams", []) if s.get("codec_type") == "subtitle"),
                     video.get("color_transfer") in ("smpte2084", "arib-std-b67"), rotation,
-                    abs(ratio(video.get("avg_frame_rate"),0) - ratio(video.get("r_frame_rate"),0)) > 0.1,
+                    bool(avg_fps and nominal_fps and abs(avg_fps - nominal_fps) > 0.1),
                     video_start_offset,
                     tuple(s.get("codec_name", "unknown") for s in data.get("streams", []) if s.get("codec_type") == "audio"),
                     (video.get("color_space") in ("bt2020nc", "bt2020c") or video.get("color_primaries") == "bt2020")
-                    and video.get("color_transfer") in (None, "unknown", "unspecified"))
+                    and video.get("color_transfer") in (None, "unknown", "unspecified"),
+                    not (avg_fps and nominal_fps),
+                    video.get("color_primaries") or "unknown", video.get("color_transfer") or "unknown",
+                    video.get("color_space") or "unknown", video.get("color_range") or "unknown")
         if media.width < 1 or media.height < 1:
             raise ValueError("Invalid input dimensions")
         return media
@@ -111,8 +161,9 @@ def lossless_working_bytes(s: Settings, media: Media) -> int | None:
     # Real-CUGAN's reference backend temporarily keeps the upscaled PNG set
     # alongside the assembled FFV1 output. This is only a raw-pixel reference;
     # actual compression and container overhead vary.
-    output_copies = 2 if s.engine == "realcugan" else 1
-    return 4 * (frames * source_pixels + output_copies * output_frames * output_pixels)
+    output_copies = 2 if s.engine == "realcugan" or s.resume_segments else 1
+    bytes_per_pixel = 6 if s.high_precision else 4
+    return bytes_per_pixel * (frames * source_pixels + output_copies * output_frames * output_pixels)
 
 
 def validate_media(s: Settings, media: Media) -> None:
@@ -124,8 +175,15 @@ def validate_media(s: Settings, media: Media) -> None:
         raise ValueError("AI processing currently requires the primary video at stream 0; remux a copy first")
     if s.engine != "none" and media.fps <= 0:
         raise ValueError("Cannot determine frame rate for the AI stage")
+    if s.engine != "none" and media.uncertain_frame_rate:
+        raise ValueError("Frame-rate metadata is incomplete; normalize a copy to CFR before AI processing")
     if s.engine != "none" and media.variable_rate:
         raise ValueError("Input frame-rate metadata indicates VFR. Normalize a copy to CFR before AI processing")
+    if s.high_precision:
+        supported = ((media.color_primaries == "bt709" and media.color_space == "bt709" and media.color_transfer == "bt709") or
+                     (media.color_primaries == "bt2020" and media.color_space == "bt2020nc" and media.color_transfer in ("smpte2084", "arib-std-b67")))
+        if not supported or media.color_range not in ("tv", "pc"):
+            raise ValueError("High-precision AI requires explicit BT.709 or BT.2020 PQ/HLG color and range metadata")
     if s.container == "mp4" and s.audio == "copy":
         supported = {"aac", "mp3", "ac3", "eac3", "alac", "opus", "flac", "truehd"}
         unsupported = sorted(set(media.audio_codecs) - supported)
@@ -139,7 +197,7 @@ def validate_media(s: Settings, media: Media) -> None:
 def ai_command(s: Settings, tools: dict, source: Path, intermediate: Path, media: Media, help_text: str) -> list[str]:
     s.validate()
     cmd = [tools["video2x"], "-i", str(source), "-o", str(intermediate), "-p", s.engine,
-           "-d", str(s.gpu), "-c", "ffv1", "--pix-fmt", "bgr0"]
+           "-d", str(s.gpu), "-c", "ffv1", "--pix-fmt", "gbrp16le" if s.high_precision else "bgr0"]
     # FFV1 preserves the RGB output without an additional chroma subsampling pass.
     if "--no-copy-audio-streams" in help_text and "--no-copy-subtitle-streams" in help_text:
         cmd += ["--no-copy-audio-streams", "--no-copy-subtitle-streams"]
@@ -172,12 +230,39 @@ def ai_command(s: Settings, tools: dict, source: Path, intermediate: Path, media
     return cmd
 
 
-def hdr_to_sdr_filters(media: Media) -> list[str]:
+def hdr_to_sdr_filters(media: Media, pixel_format: str = "yuv420p") -> list[str]:
     """Convert tagged HDR to SDR before 8-bit processing; never claim HDR output."""
     if not media.hdr:
         return []
     return ["zscale=transfer=linear:npl=100", "format=gbrpf32le", "zscale=primaries=bt709",
-            "tonemap=tonemap=hable:desat=0", "zscale=transfer=bt709:matrix=bt709:range=tv", "format=yuv420p"]
+            "tonemap=tonemap=hable:desat=0", "zscale=transfer=bt709:matrix=bt709:range=tv", f"format={pixel_format}"]
+
+
+def high_precision_input_filters(media: Media) -> list[str]:
+    matrix = "2020_ncl" if media.hdr else "709"
+    value_range = "full" if media.color_range == "pc" else "limited"
+    return [f"zscale=matrixin={matrix}:matrix=gbr:rangein={value_range}:range=full", "format=gbrp16le"]
+
+
+def high_precision_output_filters(media: Media) -> list[str]:
+    matrix = "2020_ncl" if media.hdr else "709"
+    primaries = "bt2020" if media.hdr else "bt709"
+    transfer = media.color_transfer
+    return [f"zscale=matrixin=gbr:matrix={matrix}:rangein=full:range=limited:transferin={transfer}:transfer={transfer}:primariesin={primaries}:primaries={primaries}", "format=yuv420p10le"]
+
+
+def hdr_overlay_graph(base: str, layer: str, output: str, prefix: str, transfer: str, x: str, y: str, *, shortest: bool = False) -> str:
+    """Convert an SDR RGBA layer into BT.2020 PQ/HLG before 10-bit compositing.
+
+    SDR white is mapped with a 100-nit nominal reference. HLG display brightness
+    also depends on the display's system gamma and peak luminance.
+    """
+    return (f";[{layer}]format=rgba,split[{prefix}rgb][{prefix}a];"
+            f"[{prefix}a]alphaextract,format=gray10le[{prefix}alpha];"
+            f"[{prefix}rgb]format=gbrp,zscale=matrixin=gbr:transferin=iec61966-2-1:primariesin=709:rangein=full:"
+            f"matrix=2020_ncl:transfer={transfer}:primaries=2020:range=limited:npl=100,format=yuv420p10le[{prefix}color];"
+            f"[{prefix}color][{prefix}alpha]alphamerge,format=yuva420p10le[{prefix}layer];"
+            f"[{base}][{prefix}layer]overlay=x={x}:y={y}:eof_action=repeat:repeatlast=1:format=yuv420p10:shortest={int(shortest)}[{output}]")
 
 
 def video_filter_graph(s: Settings, media: Media, video_selector: str,
@@ -185,7 +270,11 @@ def video_filter_graph(s: Settings, media: Media, video_selector: str,
                        *, preview: bool = False, timestamp: float = 0.0) -> str:
     """Shared placement and sizing for final output and source-frame preview."""
     width, height = fitted_size(s, media)
-    filters = hdr_to_sdr_filters(media) if preview or s.engine == "none" else []
+    # Direct encoding can keep 10-bit precision after tone mapping. The AI path
+    # and display preview still use their established 8-bit processing format.
+    tone_format = "yuv420p10le" if not preview and s.engine == "none" and s.pixel_format in ("yuv420p10le", "p010le") else "yuv420p"
+    filters = (high_precision_output_filters(media) if s.high_precision and not preview else
+               hdr_to_sdr_filters(media, tone_format) if preview or s.engine == "none" else [])
     if preview and subtitle_name:
         # Input seeking resets timestamps; restore the timeline for subtitle timing.
         filters.append(f"setpts=PTS+{max(0.0, timestamp):.6f}/TB")
@@ -197,15 +286,25 @@ def video_filter_graph(s: Settings, media: Media, video_selector: str,
         filters.append("deflicker=size=3:mode=am")
     filters += [f"scale={width}:{height}:flags=lanczos", "setsar=1"]
     if media.hdr:
-        filters.append("setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709")
+        if not s.high_precision or preview:
+            filters.append("setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709")
         filters += [f"sidedata=mode=delete:type={kind}" for kind in
                     ("MASTERING_DISPLAY_METADATA", "CONTENT_LIGHT_LEVEL", "DYNAMIC_HDR_PLUS", "DOVI_RPU_BUFFER", "DOVI_METADATA", "DYNAMIC_HDR_VIVID")]
     if s.aspect == "pad":
         tw, th = target_size(s, media)
         filters.append(f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:color=black")
-    if subtitle_name and s.subtitle_mode == "burn":
+    hdr_finishing = s.high_precision and media.hdr and not preview
+    if subtitle_name and s.subtitle_mode == "burn" and not hdr_finishing:
         filters.append(f"subtitles=filename={subtitle_name}")
     graph = f"[{video_selector}]" + ",".join(filters) + "[base]"
+    base_label = "base"
+    if subtitle_name and s.subtitle_mode == "burn" and hdr_finishing:
+        canvas_w, canvas_h = target_size(s, media) if s.aspect == "pad" else (width, height)
+        fps = Fraction(media.fps * (s.fps_multiplier if s.engine == "rife" else 1)).limit_denominator(100000)
+        graph += (f";color=c=black@0:s={canvas_w}x{canvas_h}:r={fps.numerator}/{fps.denominator},"
+                  f"format=rgba,subtitles=filename={subtitle_name}:alpha=1[subtitle_rgba]")
+        graph += hdr_overlay_graph(base_label, "subtitle_rgba", "subtitled", "sub", media.color_transfer, "0", "0", shortest=True)
+        base_label = "subtitled"
     if watermark_index is not None:
         margin = s.watermark_margin
         if s.watermark_corner == "free":
@@ -214,11 +313,19 @@ def video_filter_graph(s: Settings, media: Media, video_selector: str,
         else:
             x = str(margin) if s.watermark_corner.endswith("left") else f"main_w-overlay_w-{margin}"
             y = str(margin) if s.watermark_corner.startswith("top") else f"main_h-overlay_h-{margin}"
-        graph += (f";[{watermark_index}:v]scale={min(s.watermark_width, width)}:-1,format=rgba,"
-                  f"colorchannelmixer=aa={s.watermark_opacity}[wm];"
-                  f"[base][wm]overlay=x={x}:y={y}:eof_action=repeat:repeatlast=1[outv]")
+        mark_width = min(s.watermark_width, width)
+        if hdr_finishing:
+            mark_width = max(2, mark_width // 2 * 2)
+        mark_height = -2 if hdr_finishing else -1
+        graph += (f";[{watermark_index}:v]scale={mark_width}:{mark_height},format=rgba,"
+                  f"colorchannelmixer=aa={s.watermark_opacity}[wm]")
+        if hdr_finishing:
+            graph += hdr_overlay_graph(base_label, "wm", "outv", "mark", media.color_transfer, x, y)
+        else:
+            overlay_format = ":format=yuv420p10" if s.high_precision and not preview else ""
+            graph += f";[{base_label}][wm]overlay=x={x}:y={y}:eof_action=repeat:repeatlast=1{overlay_format}[outv]"
     else:
-        graph += ";[base]null[outv]"
+        graph += f";[{base_label}]null[outv]"
     return graph
 
 
@@ -246,7 +353,7 @@ def preview_command(s: Settings, tools: dict, source: Path, media: Media, timest
     return cmd + ["-filter_complex", graph, "-map", "[preview]", "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"]
 
 
-def encoder_options(s: Settings) -> list[str]:
+def encoder_options(s: Settings, media: Media | None = None) -> list[str]:
     """Identical final/compatibility-check encoder arguments, including rate control."""
     s.validate()
     cmd = ["-c:v", s.codec, "-pix_fmt", s.pixel_format, "-preset", s.preset]
@@ -271,7 +378,19 @@ def encoder_options(s: Settings) -> list[str]:
         value = getattr(s, key)
         if value > minimum:
             cmd += [f"-{flag}:v", str(value)]
-    for key, value in extra_encoder_options(s.extra_options).items():
+    options = extra_encoder_options(s.extra_options)
+    if media and media.hdr and s.high_precision and s.codec == "libx265":
+        static = []
+        if media.hdr_master_display:
+            static.append("master-display=" + media.hdr_master_display)
+        if media.hdr_content_light:
+            static.append("max-cll=" + media.hdr_content_light)
+        if static:
+            existing = options.get("x265-params", "")
+            if any(part.partition("=")[0].strip() in ("master-display", "max-cll") for part in existing.split(":")):
+                raise ValueError("Remove master-display and max-cll from extra encoder options; source HDR metadata is applied automatically")
+            options["x265-params"] = ":".join(filter(None, (existing, *static)))
+    for key, value in options.items():
         if key == "rc" and not s.bit_rate and s.codec.endswith(("_nvenc", "_amf")):
             raise ValueError("Custom rc requires explicit bitrate for GPU encoders")
         cmd += [f"-{key}", value]
@@ -289,6 +408,12 @@ def validate_output_streams(s: Settings, source: dict, output: dict, external_su
     """Check the streams that the final mapping is expected to preserve."""
     source_streams = source.get("streams", [])
     output_streams = output.get("streams", [])
+    if s.high_precision:
+        src = next((st for st in source_streams if st.get("codec_type") == "video" and not st.get("disposition", {}).get("attached_pic")), {})
+        dst = next((st for st in output_streams if st.get("codec_type") == "video"), {})
+        if (dst.get("pix_fmt") not in ("yuv420p10le", "p010le") or
+            any(dst.get(field) != src.get(field) for field in ("color_primaries", "color_transfer", "color_space"))):
+            raise ValueError("High-precision output color or bit depth verification failed; output was not published")
     for kind, expected in (
         ("audio", sum(st.get("codec_type") == "audio" for st in source_streams) if s.audio != "off" else 0),
         ("subtitle", (sum(st.get("codec_type") == "subtitle" for st in source_streams) if s.copy_subtitles else 0)
@@ -342,8 +467,11 @@ def final_command(s: Settings, tools: dict, source: Path, video: Path, output: P
     if s.copy_subtitles or subtitle_index is not None:
         cmd += ["-c:s", "mov_text" if s.container == "mp4" else "copy"]
     cmd += ["-map_metadata", "1", "-map_chapters", "1"]
-    cmd += encoder_options(s)
-    if media.hdr:
+    cmd += encoder_options(s, media)
+    if s.high_precision:
+        cmd += ["-color_primaries", media.color_primaries, "-color_trc", media.color_transfer,
+                "-colorspace", media.color_space, "-color_range", "tv"]
+    elif media.hdr:
         cmd += ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
     if s.container == "mp4":
         cmd += ["-movflags", "+faststart"]

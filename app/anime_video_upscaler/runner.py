@@ -24,8 +24,9 @@ from .config import Settings, config_dir
 from .streaming import StreamingJob
 from .subtitles import stage_subtitle
 from .disk_policy import RESERVE_BYTES, contains_disk_error, disk_error_text, preflight_threshold
+from .estimates import add_observation
 from .pipeline import (ANSI, Media, ai_command, encoder_probe_command, final_command, hdr_to_sdr_filters, output_path,
-                       lossless_working_bytes, progress_value, publish_output, validate_media, validate_output_streams)
+                       high_precision_input_filters, lossless_working_bytes, progress_value, publish_output, validate_media, validate_output_streams)
 
 RESUME_SEGMENT_SECONDS = 60
 
@@ -57,6 +58,7 @@ class QueueRunner(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.jobs: list[Job] = []
+        self.completed_observations = []
         self.current: Job | None = None
         self.process: QProcess | None = None
         self.stream_worker = None
@@ -155,6 +157,7 @@ class QueueRunner(QObject):
             subtitle_encoding = ""
             self.watermark_name = ""
             self._recovery_warning = ""
+            self._hdr_metadata_verified = False
             self._normalized_frames = 0
             self._ai_reported_frames = 0
             self._ai_success = False
@@ -222,14 +225,14 @@ class QueueRunner(QObject):
         process.start(command[0], command[1:])
         if stage in ("subtitle_check", "resume_count", "resume_verify_new", "resume_verify_existing", "verify_source_timing"):
             self._timeout.start(300_000)
-        elif stage in ("probe", "help", "filters", "encoders", "encoder_check", "verify"):
+        elif stage in ("probe", "hdr_metadata_probe", "verify_hdr_metadata", "help", "filters", "encoders", "encoder_check", "verify"):
             self._timeout.start(30_000)
 
     def _read(self):
         if self.process is None:
             return
         text = self._decoder.decode(bytes(self.process.readAllStandardOutput()))
-        if self.stage in ("probe", "subtitle_check", "help", "filters", "encoders", "encoder_check", "verify", "verify_ai", "resume_count", "resume_verify_new", "resume_verify_existing"):
+        if self.stage in ("probe", "hdr_metadata_probe", "verify_hdr_metadata", "subtitle_check", "help", "filters", "encoders", "encoder_check", "verify", "verify_ai", "resume_count", "resume_verify_new", "resume_verify_existing"):
             self._capture += text
             if len(self._capture) > 4_000_000:
                 self._timeout_error = "Unexpectedly large tool response"
@@ -355,7 +358,12 @@ class QueueRunner(QObject):
                 self._write(self._capture[-8000:])
             message = self._timeout_error or f"{self.stage} exited with code {code}. See the job log."
             if self.stage == "encoder_check":
-                message = f"{self.current.settings.codec}: GPU encoder initialization failed. Check hardware, driver, codec and log."
+                if self.current.settings.high_precision:
+                    message = ("The selected GPU encoder could not start with 10-bit output. In Advanced settings → Encoder, "
+                               "try hevc_nvenc with p010le on a supported NVIDIA GPU, or libx265 with yuv420p10le. "
+                               "Check the job log for the driver error.")
+                else:
+                    message = f"{self.current.settings.codec}: GPU encoder initialization failed. Check hardware, driver, codec and log."
             if self.stage == "subtitle_check":
                 message = "Subtitle validation failed. Check its encoding and timestamps. See the job log."
             self._finish("failed", message)
@@ -373,23 +381,50 @@ class QueueRunner(QObject):
             self.media = Media.from_probe(self.probe_data)
             validate_media(s, self.media)
             job.media_duration = self.media.duration
+            job.media_info = self.media
             if shutil.disk_usage(self.work).free < RESERVE_BYTES:
                 raise ValueError(disk_error_text(shutil.disk_usage(self.work).free, RESERVE_BYTES, job.output.parent))
-            self._subtitle_checks = []
-            if self.subtitle_name:
-                self._subtitle_checks.append((self.subtitle_name, "0:s:0"))
-            if s.copy_subtitles:
-                text_codecs = {"subrip", "ass", "ssa", "webvtt", "mov_text", "text"}
-                for stream in self.probe_data.get("streams", []):
-                    if stream.get("codec_type") == "subtitle" and stream.get("codec_name") in text_codecs:
-                        self._subtitle_checks.append((str(job.source), f"0:{int(stream['index'])}"))
-            self._check_next_subtitle()
+            if self.media.hdr and s.high_precision:
+                self._launch("hdr_metadata_probe", [self.tools["ffprobe"], "-v", "error", "-read_intervals", "%+#40",
+                    "-select_streams", str(self.media.video_index), "-show_frames", "-show_entries", "frame=side_data_list",
+                    "-of", "json", str(job.source)], self.work)
+                return
+            self._prepare_subtitle_checks()
+        elif self.stage == "hdr_metadata_probe":
+            metadata_probe = json.loads(self._capture)
+            self.media = self.media.with_hdr_side_data(metadata_probe)
+            job.media_info = self.media
+            side_data = [item for frame in metadata_probe.get("frames", []) for item in frame.get("side_data_list", [])]
+            side_data += [item for stream in self.probe_data.get("streams", []) for item in stream.get("side_data_list", [])]
+            if any(any(name in str(item.get("side_data_type", "")).lower() for name in ("dynamic hdr", "smpte2094", "dovi", "dolby vision")) for item in side_data):
+                warning = "Dynamic HDR or Dolby Vision metadata cannot be preserved after AI processing; use a compatible HDR10 source or review the output."
+                self._recovery_warning = " ".join(filter(None, (self._recovery_warning, warning)))
+                self._write(warning)
+            if self.media.hdr_master_display or self.media.hdr_content_light:
+                if s.codec == "libx265":
+                    self._write("Source HDR mastering and content-light metadata will be copied to the HEVC output; image processing can change actual brightness.")
+                else:
+                    warning = "Source HDR mastering or content-light metadata cannot be copied with the selected encoder; select libx265 to preserve it."
+                    self._recovery_warning = " ".join(filter(None, (self._recovery_warning, warning)))
+                    self._write(warning)
+            self._prepare_subtitle_checks()
         elif self.stage == "subtitle_check":
             self._write("Subtitle decoded successfully before processing.")
             self._check_next_subtitle()
         elif self.stage == "help":
             self.help_text = self._capture
             self.use_streaming = "stream-nut-v1" in self.help_text and not s.resume_segments
+            precision_capability = {"realcugan": "rgb16-realcugan-tiled-v1", "rife": "rgb16-rife-v4-v1", "libplacebo": "rgb16-libplacebo-v1"}.get(s.engine, "rgb16-realesrgan-v1")
+            if s.engine == "realcugan" and s.cugan_model != "models-nose" and s.cugan_syncgap:
+                precision_capability = "rgb16-realcugan-sync-v1"
+            if s.engine == "rife" and not s.rife_model.startswith("rife-v4"):
+                precision_capability = "rgb16-rife-legacy-v1"
+            if s.engine == "rife" and s.rife_uhd:
+                precision_capability = "rgb16-rife-uhd-v1"
+            if s.high_precision and ("stream-nut-v1" not in self.help_text or precision_capability not in self.help_text):
+                raise ValueError("High-precision AI requires a compatible source-built engine; rebuild the application runtime")
+            if s.engine == "rife" and s.rife_uhd and s.rife_model.startswith("rife-v4"):
+                self._write("RIFE v4 uses its standard full-resolution model in UHD mode; GPU memory usage is not reduced.")
             if s.resume_segments and s.engine == "realcugan":
                 if "stream-nut-v1" not in self.help_text:
                     raise ValueError("Real-CUGAN resume requires the bundled streaming-capable engine")
@@ -398,6 +433,11 @@ class QueueRunner(QObject):
                 self.use_cugan_reference = False
             if s.engine == "realcugan":
                 self._cugan_model_path()
+                if s.cugan_model == "models-pro" and s.scale == 2 and not s.high_precision and "realcugan-pro-range-v1" not in self.help_text:
+                    warning = ("Real-CUGAN models-pro at 2x produced black frames on a tested NVIDIA GPU, "
+                               "including in the reference backend. Inspect this output carefully.")
+                    self._recovery_warning = " ".join(filter(None, (self._recovery_warning, warning)))
+                    self._write(warning)
             self._check_working_space()
             # Validate model capabilities before spending time decoding.
             if self.use_cugan_reference:
@@ -405,8 +445,9 @@ class QueueRunner(QObject):
             else:
                 ai_command(s, self.tools, self.normalized, self.intermediate, self.media, self.help_text)
                 if s.engine == "realcugan" and not self.use_streaming and "stream-nut-v1" not in self.help_text:
-                    self._recovery_warning = "Legacy Real-CUGAN may ignore the selected sync gap; use the bundled reference backend."
-                    self._write(self._recovery_warning)
+                    warning = "Legacy Real-CUGAN may ignore the selected sync gap; use the bundled reference backend."
+                    self._recovery_warning = " ".join(filter(None, (self._recovery_warning, warning)))
+                    self._write(warning)
             self._check_filters()
         elif self.stage == "filters":
             required = {"scale", "pad", "setsar", "null"}
@@ -416,6 +457,10 @@ class QueueRunner(QObject):
                 required.add("subtitles")
             if s.watermark_path:
                 required.update(("overlay", "colorchannelmixer"))
+            if s.high_precision and self.media.hdr and (s.watermark_path or s.subtitle_mode == "burn"):
+                required.update(("zscale", "format", "split", "alphaextract", "alphamerge", "overlay"))
+                if s.subtitle_mode == "burn":
+                    required.add("color")
             if s.flicker == "mild":
                 required.add("deflicker")
             if s.restoration == "mild":
@@ -450,7 +495,7 @@ class QueueRunner(QObject):
             self._launch("resume_ai", ai_command(s, self.tools, self._resume_input, self._resume_ai_output, self.media, self.help_text), Path(self.tools["video2x"]).parent)
         elif self.stage == "resume_ai":
             filters = "trim=start_frame=1,setpts=PTS-STARTPTS" if s.engine == "rife" and self._resume_index else "setpts=PTS-STARTPTS"
-            self._launch("resume_trim", [self.tools["ffmpeg"], "-v", "error", "-nostdin", "-n", "-i", str(self._resume_ai_output), "-vf", filters, "-c:v", "ffv1", "-g", "1", "-threads", "1", "-pix_fmt", "bgr0", "-fps_mode", "passthrough", str(self._resume_partial)], self.work)
+            self._launch("resume_trim", [self.tools["ffmpeg"], "-v", "error", "-nostdin", "-n", "-i", str(self._resume_ai_output), "-vf", filters, "-c:v", "ffv1", "-g", "1", "-threads", "1", "-pix_fmt", "gbrp16le" if s.high_precision else "bgr0", "-fps_mode", "passthrough", str(self._resume_partial)], self.work)
         elif self.stage == "resume_trim":
             self._verify_resume_segment(self._resume_partial, "resume_verify_new")
         elif self.stage in ("resume_verify_new", "resume_verify_existing"):
@@ -459,6 +504,8 @@ class QueueRunner(QObject):
             frames = int(streams[0].get("nb_read_frames", 0)) if streams else 0
             if frames != self._resume_expected:
                 raise ValueError("Saved AI segment frame verification failed; remove the affected checkpoint and retry")
+            if s.high_precision and streams[0].get("pix_fmt") != "gbrp16le":
+                raise ValueError("Saved AI segment is not 16-bit RGB; remove the affected checkpoint and retry")
             if self.stage == "resume_verify_new":
                 os.replace(self._resume_partial, self._resume_segment)
             self._write(f"Verified segment {self._resume_index + 1}/{self._resume_count}: {frames} frames")
@@ -490,7 +537,7 @@ class QueueRunner(QObject):
         elif self.stage == "verify":
             output_probe = json.loads(self._capture)
             result = Media.from_probe(output_probe)
-            if self.media.hdr:
+            if self.media.hdr and not s.high_precision:
                 output_video = next(stream for stream in output_probe["streams"] if stream.get("codec_type") == "video" and not stream.get("disposition", {}).get("attached_pic"))
                 if output_video.get("color_transfer") != "bt709" or output_video.get("color_primaries") != "bt709":
                     raise ValueError("SDR output color metadata could not be verified; output was not published")
@@ -519,9 +566,22 @@ class QueueRunner(QObject):
             if abs(source_duration - self._verified_output_duration) > tolerance:
                 raise ValueError(f"Output video duration differs from input ({self._verified_output_duration:.3f}s vs {source_duration:.3f}s); output was not published")
             self._publish_verified()
+        elif self.stage == "verify_hdr_metadata":
+            actual = self.media.with_hdr_side_data(json.loads(self._capture))
+            if ((self.media.hdr_master_display and actual.hdr_master_display != self.media.hdr_master_display) or
+                    (self.media.hdr_content_light and actual.hdr_content_light != self.media.hdr_content_light)):
+                raise ValueError("Output HDR mastering or content-light metadata could not be verified; output was not published")
+            self._hdr_metadata_verified = True
+            self._write("Source HDR static metadata verified in the output.")
+            self._publish_verified()
 
     def _publish_verified(self):
         job = self.current
+        if (job.settings.high_precision and job.settings.codec == "libx265" and self.media.hdr and
+                (self.media.hdr_master_display or self.media.hdr_content_light) and not self._hdr_metadata_verified):
+            self._launch("verify_hdr_metadata", [self.tools["ffprobe"], "-v", "error", "-read_intervals", "%+#40",
+                "-select_streams", "v:0", "-show_frames", "-show_entries", "frame=side_data_list", "-of", "json", str(self.partial)], self.work)
+            return
         if self.partial.stat().st_size < 1:
             raise ValueError("Encoder produced an empty file")
         publish_output(self.partial, job.output)
@@ -549,6 +609,18 @@ class QueueRunner(QObject):
             self._launch("help", [self.tools["video2x"], "--help"], Path(self.tools["video2x"]).parent)
         else:
             self._check_filters()
+
+    def _prepare_subtitle_checks(self):
+        s = self.current.settings
+        self._subtitle_checks = []
+        if self.subtitle_name:
+            self._subtitle_checks.append((self.subtitle_name, "0:s:0"))
+        if s.copy_subtitles:
+            text_codecs = {"subrip", "ass", "ssa", "webvtt", "mov_text"}
+            for stream in self.probe_data.get("streams", []):
+                if stream.get("codec_type") == "subtitle" and stream.get("codec_name") in text_codecs:
+                    self._subtitle_checks.append((str(self.current.source), f"0:{int(stream['index'])}"))
+        self._check_next_subtitle()
 
     def _check_next_subtitle(self):
         if not self._subtitle_checks:
@@ -621,13 +693,14 @@ class QueueRunner(QObject):
         self._resume_input = self.work / "resume-input.mkv"
         self._resume_input.unlink(missing_ok=True)
         seek = max(0, (start - overlap) / self.media.fps + self.media.video_start_offset)
+        filters = high_precision_input_filters(self.media) if self.current.settings.high_precision else hdr_to_sdr_filters(self.media)
         command = [self.tools["ffmpeg"], "-v", "error", "-nostdin", "-n", "-ss", f"{seek:.9f}", "-i", str(self.current.source),
                    "-map", f"0:{self.media.video_index}", "-an", "-sn", "-dn", "-frames:v", str(source_frames + overlap),
-                   "-vf", ",".join(hdr_to_sdr_filters(self.media) + ["setpts=PTS-STARTPTS"]), "-c:v", "ffv1", "-pix_fmt", "bgr0", "-fps_mode", "passthrough", str(self._resume_input)]
+                   "-vf", ",".join(filters + ["setpts=PTS-STARTPTS"]), "-c:v", "ffv1", "-pix_fmt", "gbrp16le" if self.current.settings.high_precision else "bgr0", "-fps_mode", "passthrough", str(self._resume_input)]
         self._launch("resume_decode", command, self.work)
 
     def _verify_resume_segment(self, path, stage):
-        self._launch(stage, [self.tools["ffprobe"], "-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries", "stream=nb_read_frames", "-of", "json", str(path)], self.work)
+        self._launch(stage, [self.tools["ffprobe"], "-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries", "stream=nb_read_frames,pix_fmt", "-of", "json", str(path)], self.work)
 
     def _cleanup_resume(self):
         if not self._resume_dir:
@@ -764,6 +837,12 @@ class QueueRunner(QObject):
     def _finish(self, state, error=""):
         self._disk_watch.stop()
         if self.current:
+            if state == "done" and self.started_at and self.current.output:
+                try:
+                    add_observation(self.completed_observations, self.current.settings, self.current.media_info,
+                                    time.monotonic() - self.started_at, self.current.output.stat().st_size)
+                except OSError:
+                    pass
             if state not in ("done", "done_warning") and self.current.output:
                 self._reserved.discard(os.path.normcase(str(self.current.output.resolve())))
             self.current.state = state

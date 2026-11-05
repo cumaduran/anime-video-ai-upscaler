@@ -88,14 +88,18 @@ class StreamingJob(QThread):
 
     def run(self):
         try:
-            from .pipeline import hdr_to_sdr_filters
-            filters = hdr_to_sdr_filters(self.media)
+            from .pipeline import hdr_to_sdr_filters, high_precision_input_filters
+            filters = high_precision_input_filters(self.media) if self.settings.high_precision else hdr_to_sdr_filters(self.media)
             if self.settings.restoration == 'mild':
-                filters.append('hqdn3d=1.5:1.5:3:3')
+                if self.settings.high_precision:
+                    filters.insert(0, 'hqdn3d=1.5:1.5:3:3')
+                else:
+                    filters.append('hqdn3d=1.5:1.5:3:3')
             filters.append('setpts=PTS-STARTPTS')
             decode = [self.tools['ffmpeg'],'-hide_banner','-v','error','-nostdin',
                 '-i',str(self.source),'-map',f'0:{self.media.video_index}','-an','-sn','-dn',
-                '-vf',','.join(filters),'-c:v','rawvideo','-pix_fmt','bgr0','-fps_mode','passthrough',
+                '-vf',','.join(filters),'-c:v','rawvideo','-pix_fmt',
+                'gbrp16le' if self.settings.high_precision else 'bgr0','-fps_mode','passthrough',
                 '-progress','pipe:2','-nostats','-f','nut','pipe:1']
             first = self._start(decode,'decode',stdout=subprocess.PIPE)
             self._reader(first.stderr,'decode',True)

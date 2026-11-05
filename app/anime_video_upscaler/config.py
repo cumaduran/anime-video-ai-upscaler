@@ -72,6 +72,7 @@ class Settings:
     hwaccel: str = "none"
     recover_shutdown: bool = False
     resume_segments: bool = False
+    high_precision: bool = False
     target: str = "4k"
     width: int = 3840
     height: int = 2160
@@ -150,8 +151,15 @@ class Settings:
             raise ValueError("Target width and height must be even")
         if self.engine == "realesrgan" and self.model != "realesr-animevideov3" and self.scale != 4:
             raise ValueError("This Real-ESRGAN model requires 4× scaling")
-        if self.resume_segments and (self.engine not in ("realesrgan", "realcugan", "libplacebo", "rife") or self.restoration != "off"):
-            raise ValueError("Resume by segments requires an AI engine and denoise off")
+        if self.high_precision:
+            if self.pixel_format not in ("yuv420p10le", "p010le"):
+                raise ValueError("High-precision AI requires 10-bit output. In Advanced settings → Encoder, select libx265 as Video encoder and yuv420p10le as Pixel format. Alternatively, NVIDIA users can select hevc_nvenc and p010le if supported by their GPU. Some H.264 encoders cannot produce 10-bit output.")
+            if self.engine not in ("realesrgan", "libplacebo", "realcugan", "rife"):
+                raise ValueError("High-precision AI requires an AI engine. In Advanced settings → AI → AI engine, choose Real-ESRGAN, Real-CUGAN, Anime4K or RIFE, or turn high-precision AI off.")
+        if self.resume_segments and self.engine not in ("realesrgan", "realcugan", "libplacebo", "rife"):
+            raise ValueError("Resume using saved AI segments needs an AI engine. In Advanced settings → AI, choose Real-ESRGAN, Real-CUGAN, Anime4K or RIFE; alternatively turn off Resume using saved AI segments.")
+        if self.resume_segments and self.restoration != "off":
+            raise ValueError("Resume using saved AI segments cannot be combined with Denoise before AI. In Advanced settings → Finishing, set Denoise before AI to Off; alternatively turn off Resume using saved AI segments under AI. Denoise level is a separate setting.")
         if self.engine == "realcugan":
             if self.cugan_model == "models-nose" and (self.noise != 0 or self.scale != 2):
                 raise ValueError("models-nose requires scale 2 and noise 0")

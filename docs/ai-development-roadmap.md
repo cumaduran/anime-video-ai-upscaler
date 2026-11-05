@@ -13,9 +13,14 @@ motorlar henüz uygulamaya eklenmiş veya gerçek anime görüntüleriyle doğru
 - Karelerin bağımsız işlenmesi bazı görüntülerde ayrıntının kareler arasında
   değişmesine yol açabilir. Deneysel deflicker yalnız parlaklığı hedefler; çizgi
   titreşimini veya hatalı hareketi otomatik olarak çözmez.
-- Kaynak koddan derlenen yerel motor, 8 bit RGB kareleri doğrudan son kodlayıcıya
+- Standart yerel motor yolu 8 bit RGB kareleri doğrudan son kodlayıcıya
   aktarır; tam uzunlukta AI ara dosyası kullanmaz. 10 bit çıktı kaybolan hassasiyeti
   geri getirmez. Eski motorlarda FFV1 veya PNG ara dosyalı uyumluluk yolu bulunur.
+- Deneysel yüksek hassasiyetli Real-ESRGAN, Real-CUGAN models-nose ve RIFE v4
+  yolları 16 bit RGB girdi/çıktı kullanır;
+  PQ/HLG renk etiketlerini korur ancak HDR mastering ve dinamik üst verilerini
+  taşımaz. SDR için eğitilmiş modeller HDR'yi bozabilir; gerçek sahnelerde ve
+  farklı donanımlarda karşılaştırma gereklidir.
 - Yeni motor NVIDIA RTX 3070 Ti üzerinde dört modelle ve 61. bölümün tamamıyla
   denendi; Vulkan kapanışındaki çökme bu testlerde görülmedi. AMD, diğer sürücü
   sürümleri ve farklı uzun kaynaklarda ek test gereklidir.

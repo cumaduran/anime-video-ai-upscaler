@@ -29,6 +29,8 @@ class LIBREALESRGAN_API RealESRGAN {
     int load(const std::filesystem::path &parampath, const std::filesystem::path &modelpath);
 
     int process(const ncnn::Mat &inimage, ncnn::Mat &outimage) const;
+    // Planar RGB float in [0,1]; preserves sub-8-bit input detail.
+    int process_float(const ncnn::Mat &inimage, ncnn::Mat &outimage) const;
 
    public:
     // realesrgan parameters

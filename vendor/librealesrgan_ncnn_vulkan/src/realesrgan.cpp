@@ -200,6 +200,67 @@ int RealESRGAN::load(const std::filesystem::path &parampath, const std::filesyst
     return 0;
 }
 
+int RealESRGAN::process_float(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
+{
+    if (tta_mode || inimage.dims != 3 || inimage.c != 3 || inimage.elemsize != 4u ||
+        outimage.dims != 3 || outimage.c != 3 || outimage.elemsize != 4u ||
+        outimage.w != inimage.w * scale || outimage.h != inimage.h * scale || tilesize < 1)
+        return -1;
+
+    auto reflect = [](int p, int length) {
+        if (length <= 1) return 0;
+        const int period = 2 * (length - 1);
+        p = ((p % period) + period) % period;
+        return p < length ? p : period - p;
+    };
+    for (int y = 0; y < inimage.h; y += tilesize)
+    {
+        for (int x = 0; x < inimage.w; x += tilesize)
+        {
+            const int w = std::min(tilesize, inimage.w - x);
+            const int h = std::min(tilesize, inimage.h - y);
+            ncnn::Mat tile(w + prepadding * 2, h + prepadding * 2, 3, (size_t)4u);
+            if (tile.empty()) return -1;
+            for (int c = 0; c < 3; ++c)
+            {
+                const ncnn::Mat src = inimage.channel(c);
+                ncnn::Mat dst = tile.channel(c);
+                for (int ty = 0; ty < tile.h; ++ty)
+                {
+                    const float* row = src.row<float>(reflect(y + ty - prepadding, inimage.h));
+                    float* target = dst.row<float>(ty);
+                    const int first = std::max(0, prepadding - x);
+                    const int last = std::min(tile.w, prepadding + inimage.w - x);
+                    for (int tx = 0; tx < first; ++tx)
+                        target[tx] = row[reflect(x + tx - prepadding, inimage.w)];
+                    if (last > first)
+                        memcpy(target + first, row + x + first - prepadding, (size_t)(last - first) * sizeof(float));
+                    for (int tx = last; tx < tile.w; ++tx)
+                        target[tx] = row[reflect(x + tx - prepadding, inimage.w)];
+                }
+            }
+            ncnn::Extractor ex = net.create_extractor();
+            if (ex.input("data", tile) != 0) return -1;
+            ncnn::Mat result;
+            if (ex.extract("output", result) != 0 || result.empty() || result.c != 3 ||
+                result.elemsize != 4u || result.w != tile.w * scale || result.h != tile.h * scale)
+                return -1;
+            for (int c = 0; c < 3; ++c)
+            {
+                const ncnn::Mat src = result.channel(c);
+                ncnn::Mat dst = outimage.channel(c);
+                for (int ty = 0; ty < h * scale; ++ty)
+                {
+                    const float* row = src.row<float>(ty + prepadding * scale) + prepadding * scale;
+                    float* target = dst.row<float>(y * scale + ty) + x * scale;
+                    memcpy(target, row, (size_t)w * scale * sizeof(float));
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 int RealESRGAN::process(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
 {
     const unsigned char* pixeldata = (const unsigned char*)inimage.data;

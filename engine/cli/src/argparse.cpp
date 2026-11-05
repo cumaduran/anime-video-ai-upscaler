@@ -208,7 +208,7 @@ int parse_args(
 #endif
 
         if (vm.count("help") || argc == 1) {
-            std::cout << "AVUE capabilities: stream-nut-v1 explicit-vulkan-shutdown" << std::endl;
+            std::cout << "AVUE capabilities: stream-nut-v1 explicit-vulkan-shutdown rgb16-realesrgan-v1 rgb16-realcugan-tiled-v1 rgb16-realcugan-sync-v1 rgb16-rife-v4-v1 rgb16-rife-legacy-v1 rgb16-rife-uhd-v1 rgb16-libplacebo-v1 realcugan-pro-range-v1" << std::endl;
             std::cout
                 << all_opts << std::endl
                 << "Examples:" << std::endl

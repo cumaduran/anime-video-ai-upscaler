@@ -420,9 +420,10 @@ int RIFE::process(const ncnn::Mat& in0image, const ncnn::Mat& in1image, float ti
     opt.workspace_vkallocator = blob_vkallocator;
     opt.staging_vkallocator = staging_vkallocator;
 
-    // pad to 32n
-    int w_padded = (w + 31) / 32 * 32;
-    int h_padded = (h + 31) / 32 * 32;
+    // UHD runs flow on a half-size image, which must itself be 32-aligned.
+    const int padding = uhd_mode ? 64 : 32;
+    int w_padded = (w + padding - 1) / padding * padding;
+    int h_padded = (h + padding - 1) / padding * padding;
 
     const size_t in_out_tile_elemsize = opt.use_fp16_storage ? 2u : 4u;
 
@@ -1236,8 +1237,9 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
     ncnn::Option opt = flownet.opt;
 
     // RIFE models version > 4.6 has different padding logic
-    int w_padded = (w + rife_padding - 1) / rife_padding * rife_padding;
-    int h_padded = (h + rife_padding - 1) / rife_padding * rife_padding;
+    const int padding = uhd_mode ? 64 : rife_padding;
+    int w_padded = (w + padding - 1) / padding * padding;
+    int h_padded = (h + padding - 1) / padding * padding;
 
     ncnn::Mat in0;
     ncnn::Mat in1;
@@ -2456,6 +2458,163 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
 #endif
     }
 
+    return 0;
+}
+
+int RIFE::process_legacy_float(const ncnn::Mat& in0image, const ncnn::Mat& in1image, float timestep, ncnn::Mat& outimage) const
+{
+    if (timestep < 0.f || timestep > 1.f) return -1;
+    // Legacy models predict only a midpoint. Bisect repeatedly for other
+    // requested times instead of returning the same midpoint for every frame.
+    ncnn::Mat left = in0image, right = in1image, chosen;
+    float lo = 0.f, hi = 1.f;
+    if (timestep == 0.f) chosen = left;
+    else if (timestep == 1.f) chosen = right;
+    else for (int iteration = 0; iteration < 8; ++iteration) {
+        ncnn::Mat middle(in0image.w, in0image.h, 3, (size_t)4u);
+        if (middle.empty() || process_legacy_midpoint_float(left, right, 0.5f, middle)) return -1;
+        const float midpoint = (lo + hi) * 0.5f;
+        chosen = middle;
+        if (timestep == midpoint) break;
+        if (timestep < midpoint) { right = middle; hi = midpoint; }
+        else { left = middle; lo = midpoint; }
+    }
+    if (chosen.empty() || outimage.w != chosen.w || outimage.h != chosen.h || outimage.c != 3 || outimage.elemsize != 4u) return -1;
+    for (int c = 0; c < 3; ++c) {
+        const ncnn::Mat src = chosen.channel(c); ncnn::Mat dst = outimage.channel(c);
+        for (int y = 0; y < chosen.h; ++y)
+            memcpy(dst.row<float>(y), src.row<float>(y), (size_t)chosen.w * sizeof(float));
+    }
+    return 0;
+}
+
+int RIFE::process_legacy_midpoint_float(const ncnn::Mat& in0image, const ncnn::Mat& in1image, float timestep, ncnn::Mat& outimage) const
+{
+    if (rife_v4 || !vkdev || tta_mode || tta_temporal_mode ||
+        in0image.dims != 3 || in0image.c != 3 || in0image.elemsize != 4u ||
+        in1image.w != in0image.w || in1image.h != in0image.h || in1image.c != 3 || in1image.elemsize != 4u ||
+        outimage.w != in0image.w || outimage.h != in0image.h || outimage.c != 3 || outimage.elemsize != 4u ||
+        timestep < 0.f || timestep > 1.f) return -1;
+    // The UHD flow network sees a half-size image, so the full input must be
+    // padded to 64 pixels to retain the network's 32-pixel alignment.
+    const int align = uhd_mode ? 64 : 32;
+    const int pw = (in0image.w + align - 1) / align * align, ph = (in0image.h + align - 1) / align * align;
+    ncnn::Mat a(pw, ph, 3, (size_t)4u), b(pw, ph, 3, (size_t)4u);
+    if (a.empty() || b.empty()) return -1;
+    a.fill(0.f); b.fill(0.f);
+    for (int c = 0; c < 3; ++c) {
+        ncnn::Mat da = a.channel(c), db = b.channel(c);
+        const ncnn::Mat sa = in0image.channel(c), sb = in1image.channel(c);
+        for (int y = 0; y < in0image.h; ++y) {
+            memcpy(da.row<float>(y), sa.row<float>(y), (size_t)in0image.w * sizeof(float));
+            memcpy(db.row<float>(y), sb.row<float>(y), (size_t)in0image.w * sizeof(float));
+        }
+    }
+    ncnn::Mat uhd_flow;
+    if (uhd_mode) {
+        // Use a synchronized CPU/GPU boundary for the flow pyramid. This
+        // avoids the nondeterministic asynchronous Vulkan resize path.
+        ncnn::Mat small0, small1, small_flow;
+        ncnn::resize_bilinear(a, small0, pw / 2, ph / 2);
+        ncnn::resize_bilinear(b, small1, pw / 2, ph / 2);
+        if (small0.empty() || small1.empty()) return -1;
+        ncnn::Extractor ex = flownet.create_extractor();
+        if (ex.input("input0", small0) || ex.input("input1", small1) ||
+            ex.extract("flow", small_flow) || small_flow.empty() || small_flow.elemsize != 4u) return -1;
+        ncnn::resize_bilinear(small_flow, uhd_flow, small_flow.w * 2, small_flow.h * 2);
+        if (uhd_flow.empty()) return -1;
+        for (int c = 0; c < uhd_flow.c; ++c) {
+            ncnn::Mat channel = uhd_flow.channel(c);
+            for (int y = 0; y < channel.h; ++y) {
+                float* row = channel.row<float>(y);
+                for (int x = 0; x < channel.w; ++x) row[x] *= 2.f;
+            }
+        }
+    }
+    ncnn::VkAllocator* blob = vkdev->acquire_blob_allocator();
+    ncnn::VkAllocator* staging = vkdev->acquire_staging_allocator();
+    ncnn::Mat result;
+    int status = [&]() -> int {
+        ncnn::Option opt = flownet.opt;
+        opt.blob_vkallocator = blob; opt.workspace_vkallocator = blob; opt.staging_vkallocator = staging;
+        ncnn::VkCompute cmd(vkdev);
+        ncnn::VkMat ga, gb, flow, flow0, flow1, ctx0[4], ctx1[4], output;
+        cmd.record_upload(a, ga, opt); cmd.record_upload(b, gb, opt);
+        auto alloc = [&](ncnn::Extractor& ex) {
+            ex.set_blob_vkallocator(blob); ex.set_workspace_vkallocator(blob); ex.set_staging_vkallocator(staging);
+        };
+        if (uhd_mode) {
+            cmd.record_upload(uhd_flow, flow, opt);
+        } else {
+            ncnn::Extractor ex = flownet.create_extractor(); alloc(ex);
+            if (ex.input("input0", ga) || ex.input("input1", gb) || ex.extract("flow", flow, cmd)) return -1;
+        }
+        if (rife_v2) {
+            std::vector<ncnn::VkMat> inputs(1, flow), outputs(2);
+            if (rife_v2_slice_flow->forward(inputs, outputs, cmd, opt)) return -1;
+            flow0 = outputs[0]; flow1 = outputs[1];
+        }
+        const char* features[] = {"f1", "f2", "f3", "f4"};
+        for (int i = 0; i < 2; ++i) {
+            ncnn::Extractor ex = contextnet.create_extractor(); alloc(ex);
+            if (ex.input("input.1", i ? gb : ga) ||
+                ex.input(rife_v2 || i == 0 ? "flow.0" : "flow.1", rife_v2 ? (i ? flow1 : flow0) : flow)) return -1;
+            for (int j = 0; j < 4; ++j)
+                if (ex.extract(features[j], i ? ctx1[j] : ctx0[j], cmd)) return -1;
+        }
+        {
+            ncnn::Extractor ex = fusionnet.create_extractor(); alloc(ex);
+            if (ex.input("img0", ga) || ex.input("img1", gb) || ex.input("flow", flow)) return -1;
+            const char* names[] = {"3", "4", "5", "6", "7", "8", "9", "10"};
+            for (int j = 0; j < 8; ++j) if (ex.input(names[j], j < 4 ? ctx0[j] : ctx1[j - 4])) return -1;
+            if (ex.extract("output", output, cmd)) return -1;
+        }
+        cmd.record_download(output, result, opt);
+        return cmd.submit_and_wait();
+    }();
+    vkdev->reclaim_blob_allocator(blob); vkdev->reclaim_staging_allocator(staging);
+    if (status || result.empty() || result.c != 3 || result.elemsize != 4u || result.w < in0image.w || result.h < in0image.h) return -1;
+    for (int c = 0; c < 3; ++c) {
+        const ncnn::Mat src = result.channel(c); ncnn::Mat dst = outimage.channel(c);
+        for (int y = 0; y < in0image.h; ++y)
+            memcpy(dst.row<float>(y), src.row<float>(y), (size_t)in0image.w * sizeof(float));
+    }
+    return 0;
+}
+
+int RIFE::process_v4_float(const ncnn::Mat& in0image, const ncnn::Mat& in1image, float timestep, ncnn::Mat& outimage) const
+{
+    if (!rife_v4 || tta_mode || tta_temporal_mode || rife_padding < 1 ||
+        in0image.dims != 3 || in0image.c != 3 || in0image.elemsize != 4u ||
+        in1image.w != in0image.w || in1image.h != in0image.h || in1image.c != 3 || in1image.elemsize != 4u ||
+        outimage.w != in0image.w || outimage.h != in0image.h || outimage.c != 3 || outimage.elemsize != 4u ||
+        timestep < 0.f || timestep > 1.f)
+        return -1;
+    const int pw = (in0image.w + rife_padding - 1) / rife_padding * rife_padding;
+    const int ph = (in0image.h + rife_padding - 1) / rife_padding * rife_padding;
+    ncnn::Mat input0(pw, ph, 3, (size_t)4u), input1(pw, ph, 3, (size_t)4u);
+    ncnn::Mat time(pw, ph, 1, (size_t)4u);
+    if (input0.empty() || input1.empty() || time.empty()) return -1;
+    input0.fill(0.f); input1.fill(0.f); time.fill(timestep);
+    for (int c = 0; c < 3; ++c) {
+        const ncnn::Mat src0 = in0image.channel(c), src1 = in1image.channel(c);
+        ncnn::Mat dst0 = input0.channel(c), dst1 = input1.channel(c);
+        for (int y = 0; y < in0image.h; ++y) {
+            memcpy(dst0.row<float>(y), src0.row<float>(y), (size_t)in0image.w * sizeof(float));
+            memcpy(dst1.row<float>(y), src1.row<float>(y), (size_t)in0image.w * sizeof(float));
+        }
+    }
+    ncnn::Extractor ex = flownet.create_extractor();
+    if (ex.input("in0", input0) != 0 || ex.input("in1", input1) != 0 || ex.input("in2", time) != 0) return -1;
+    ncnn::Mat result;
+    if (ex.extract("out0", result) != 0 || result.empty() || result.c != 3 || result.elemsize != 4u ||
+        result.w < in0image.w || result.h < in0image.h) return -1;
+    for (int c = 0; c < 3; ++c) {
+        const ncnn::Mat src = result.channel(c);
+        ncnn::Mat dst = outimage.channel(c);
+        for (int y = 0; y < in0image.h; ++y)
+            memcpy(dst.row<float>(y), src.row<float>(y), (size_t)in0image.w * sizeof(float));
+    }
     return 0;
 }
 

@@ -34,6 +34,7 @@ public:
 #endif
 
     int process(const ncnn::Mat& inimage, ncnn::Mat& outimage) const;
+    int process_float(const ncnn::Mat& inimage, ncnn::Mat& outimage) const;
 
     int process_cpu(const ncnn::Mat& inimage, ncnn::Mat& outimage) const;
 
@@ -71,6 +72,7 @@ public:
     int tilesize;
     int prepadding;
     int syncgap;
+    bool pro_mode;
 
 private:
     ncnn::VulkanDevice* vkdev;

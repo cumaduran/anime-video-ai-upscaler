@@ -38,6 +38,22 @@ def test_packet_timing_verification_accepts_matching_video_and_rejects_truncatio
         assert not published
 
 
+def test_hdr_static_metadata_warns_when_encoder_cannot_preserve_it(app, monkeypatch):
+    runner = QueueRunner()
+    runner.current = type('Job', (), {'settings': replace(Settings(), engine='rife', high_precision=True,
+                                                         codec='hevc_nvenc', pixel_format='p010le', preset='p6')})()
+    runner.media = Media(96, 64, 1, 2, hdr=True)
+    runner.probe_data = {'streams': []}
+    runner._recovery_warning = ''
+    runner.stage = 'hdr_metadata_probe'
+    runner._capture = json.dumps({'frames': [{'side_data_list': [
+        {'side_data_type': 'Content light level metadata', 'max_content': 1000, 'max_average': 400}]}]})
+    advanced = []
+    monkeypatch.setattr(runner, '_prepare_subtitle_checks', lambda: advanced.append(True))
+    runner._advance()
+    assert advanced and 'select libx265' in runner._recovery_warning
+
+
 @pytest.fixture
 def tools():
     ffmpeg=os.environ.get("ANIME_TEST_FFMPEG","")
@@ -65,10 +81,14 @@ def test_queue_media_preflight_reports_invalid_files(app, tools, media_files, tm
 
 def test_readiness_report_shows_media_encoder_and_free_space(app, tools, media_files, monkeypatch):
     from PySide6.QtWidgets import QDialog, QPlainTextEdit
+    from anime_video_upscaler.estimates import add_observation
     from anime_video_upscaler.gui import MainWindow
     monkeypatch.setattr('anime_video_upscaler.gui.detect_tools', lambda: tools)
     window = MainWindow()
     window.add_paths([str(media_files[0])])
+    probe = json.loads(run([tools['ffprobe'], '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(media_files[0])]))
+    media = Media.from_probe(probe)
+    add_observation(window.runner.completed_observations, window.runner.jobs[0].settings, media, 30, 1024 * 1024)
     reports = []
     def capture(dialog):
         reports.append(dialog.findChild(QPlainTextEdit).toPlainText())
@@ -78,7 +98,112 @@ def test_readiness_report_shows_media_encoder_and_free_space(app, tools, media_f
     assert len(reports) == 1
     assert media_files[0].name in reports[0]
     assert '96 × 64' in reports[0] and window.store.value.codec in reports[0] and 'GiB' in reports[0]
+    assert 'Estimate from comparable completed jobs in this session' in reports[0]
     window.close()
+
+
+def test_readiness_report_warns_about_resume_disk_requirements(app, tools, media_files, monkeypatch):
+    from PySide6.QtWidgets import QDialog, QPlainTextEdit
+    from anime_video_upscaler.gui import MainWindow
+    monkeypatch.setattr('anime_video_upscaler.gui.detect_tools', lambda: tools)
+    window = MainWindow()
+    window.add_paths([str(media_files[0])])
+    job = window.runner.jobs[0]
+    job.settings = replace(job.settings, resume_segments=True)
+    checkpoint = media_files[0].parent / ('.anime-resume-' + job.id + '-' + 'a' * 16)
+    checkpoint.mkdir()
+    (checkpoint / 'manifest.json').write_text(json.dumps({'version': 3, 'source': str(media_files[0])}), encoding='utf-8')
+    (checkpoint / 'part-000000.mkv').write_bytes(b'example')
+    reports = []
+    def capture(dialog):
+        reports.append(dialog.findChild(QPlainTextEdit).toPlainText())
+        return QDialog.DialogCode.Rejected
+    monkeypatch.setattr(QDialog, 'exec', capture)
+    window.queue_report()
+    assert 'Resume mode stores lossless AI segments' in reports[0]
+    assert 'Resume mode safety threshold, not a disk-space prediction' in reports[0]
+    assert 'Possible saved checkpoints for this job: 1' in reports[0]
+    assert 'Saved segments: 1' in reports[0]
+    window.close()
+
+
+@pytest.mark.parametrize('watermark,subtitles', [(True, False), (False, True), (True, True)])
+@pytest.mark.parametrize('transfer', ['bt709', 'smpte2084', 'arib-std-b67'])
+def test_high_precision_finishing_preserves_untouched_ten_bit_luma(tools, media_files, tmp_path, watermark, subtitles, transfer):
+    import array
+    from anime_video_upscaler.pipeline import video_filter_graph
+    subtitle = tmp_path / 'subtitle.srt'
+    subtitle.write_text('1\n00:00:00,000 --> 00:00:00,900\nTest\n', encoding='utf-8')
+    hdr = transfer != 'bt709'
+    media = Media(256, 32, 1, 1, hdr=hdr, color_primaries='bt2020' if hdr else 'bt709', color_transfer=transfer,
+                  color_space='bt2020nc' if hdr else 'bt709', color_range='tv')
+    settings = replace(Settings(), high_precision=True, pixel_format='yuv420p10le', target='native', aspect='fit',
+                       watermark_path=str(media_files[2]) if watermark else '', watermark_width=32, watermark_margin=4,
+                       subtitle_mode='burn' if subtitles else 'off', subtitle_path=str(subtitle) if subtitles else '')
+    settings.validate()
+    def frame(with_finishing):
+        logo = watermark and with_finishing
+        sub = subtitles and with_finishing
+        graph = video_filter_graph(settings, media, '0:v:0', 1 if logo else None, 'subtitle.srt' if sub else '')
+        cmd = [tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i',
+               "nullsrc=s=512x64:r=1:d=1,format=gbrp16le,geq=r='X*128':g='X*128':b='X*128'"]
+        if logo:
+            cmd += ['-i', str(media_files[2])]
+        cmd += ['-filter_complex', graph, '-map', '[outv]', '-frames:v', '1', '-pix_fmt', 'yuv420p10le', '-f', 'rawvideo', '-']
+        process = subprocess.run(cmd, cwd=tmp_path, capture_output=True, timeout=30)
+        assert process.returncode == 0, process.stderr.decode('utf-8', 'replace')
+        result = process.stdout
+        values = array.array('H'); values.frombytes(result)
+        return values
+    baseline, finished = frame(False), frame(True)
+    assert len(set(finished[:512 * 8])) > 256
+    assert max(abs(a - b) for a, b in zip(baseline[:512 * 8], finished[:512 * 8])) <= 2
+    assert sum(abs(a - b) for a, b in zip(baseline, finished)) > 100
+
+
+@pytest.mark.parametrize('transfer,expected', [('smpte2084', 506), ('arib-std-b67', 614)])
+def test_hdr_white_overlay_uses_reference_brightness(tools, transfer, expected):
+    import array
+    from anime_video_upscaler.pipeline import hdr_overlay_graph
+    graph = '[1:v]format=rgba[wm]' + hdr_overlay_graph('0:v', 'wm', 'out', 'test', transfer, '0', '0')
+    result = subprocess.run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i',
+                             'color=black:s=64x64:r=1:d=1,format=yuv420p10le', '-f', 'lavfi', '-i',
+                             'color=white:s=32x32:r=1:d=1,format=rgba', '-filter_complex', graph,
+                             '-map', '[out]', '-frames:v', '1', '-pix_fmt', 'yuv420p10le', '-f', 'rawvideo', '-'],
+                            check=True, capture_output=True, timeout=30)
+    values = array.array('H'); values.frombytes(result.stdout)
+    assert values[10 * 64 + 10] == pytest.approx(expected, abs=2)
+    assert values[50 * 64 + 50] == 64
+
+
+def test_hdr_subtitle_layer_is_visible_and_bounded(tools, tmp_path):
+    import array
+    from anime_video_upscaler.pipeline import video_filter_graph
+    (tmp_path / 'subtitle.srt').write_text('1\n00:00:00,000 --> 00:00:00,900\nTEST SUBTITLE\n', encoding='utf-8')
+    media = Media(160, 90, 1, 1, hdr=True, color_primaries='bt2020', color_transfer='smpte2084',
+                  color_space='bt2020nc', color_range='tv')
+    settings = replace(Settings(), high_precision=True, pixel_format='yuv420p10le', target='native', aspect='fit',
+                       subtitle_mode='burn', subtitle_path='subtitle.srt')
+    graph = video_filter_graph(settings, media, '0:v:0', None, 'subtitle.srt')
+    result = subprocess.run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i',
+                             'color=black:s=320x180:r=1:d=1,format=gbrp16le', '-filter_complex', graph,
+                             '-map', '[outv]', '-frames:v', '1', '-pix_fmt', 'yuv420p10le', '-f', 'rawvideo', '-'],
+                            cwd=tmp_path, check=True, capture_output=True, timeout=30)
+    values = array.array('H'); values.frombytes(result.stdout)
+    luminance = values[:320 * 180]
+    assert 250 < max(luminance) < 550
+    assert luminance[0] == 64
+
+
+@pytest.mark.parametrize('filter_graph', ['hqdn3d=1.5:1.5:3:3', 'deflicker=size=3:mode=am'])
+def test_restoration_filters_retain_more_than_eight_bit_levels(tools, filter_graph):
+    import array
+    source = "nullsrc=s=512x32:r=2:d=1,format=yuv420p10le,geq=lum='64+X':cb=512:cr=512"
+    result = subprocess.run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', source, '-vf', filter_graph,
+                             '-frames:v', '1', '-pix_fmt', 'yuv420p10le', '-f', 'rawvideo', '-'],
+                            check=True, capture_output=True, timeout=30)
+    values = array.array('H'); values.frombytes(result.stdout)
+    assert len(set(values[:512 * 32])) > 256
 
 
 def test_comparison_reports_measured_video_only_estimate(app, tools, media_files):
@@ -100,7 +225,7 @@ def test_comparison_reports_measured_video_only_estimate(app, tools, media_files
     timer.stop()
     assert dialog.job and dialog.job.state == "done", dialog.job.error if dialog.job else "sample did not start"
     assert "Estimated full video" in dialog.results.toPlainText()
-    assert "Audio, subtitles and startup time are excluded" in dialog.results.toPlainText()
+    assert "sample startup can affect the time estimate" in dialog.results.toPlainText()
     dialog.reject()
 
 
@@ -121,14 +246,16 @@ def test_rotated_source_is_oriented_and_output_has_no_rotation(app, tools, media
 
 
 @pytest.mark.parametrize("transfer", ["smpte2084", "arib-std-b67"])
-def test_hdr_source_is_tone_mapped_to_sdr(app, tools, tmp_path, transfer):
+@pytest.mark.parametrize("pixel_format", ["yuv420p", "yuv420p10le"])
+def test_hdr_source_is_tone_mapped_to_sdr(app, tools, tmp_path, transfer, pixel_format):
     source = tmp_path / f"hdr-{transfer}.mkv"
     run([tools["ffmpeg"], "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=96x64:rate=12:duration=1",
          "-vf", f"setparams=color_primaries=bt2020:color_trc={transfer}:colorspace=bt2020nc",
          "-c:v", "libx265", "-preset", "ultrafast", "-x265-params", f"log-level=error:colorprim=bt2020:transfer={transfer}:colormatrix=bt2020nc", "-pix_fmt", "yuv420p10le", "-color_primaries", "bt2020", "-color_trc", transfer,
          "-colorspace", "bt2020nc", str(source)])
     runner = QueueRunner()
-    settings = replace(Settings(), engine="none", target="native", preset="ultrafast", output_dir=str(tmp_path), copy_subtitles=False)
+    settings = replace(Settings(), engine="none", target="native", codec="libx265", pixel_format=pixel_format,
+                       preset="ultrafast", output_dir=str(tmp_path), copy_subtitles=False)
     job = runner.enqueue([source], settings)[0]
     wait_runner(app, runner, tools)
     assert job.state == "done", job.error
@@ -136,7 +263,637 @@ def test_hdr_source_is_tone_mapped_to_sdr(app, tools, tmp_path, transfer):
     video = next(s for s in probe["streams"] if s["codec_type"] == "video")
     assert video["color_transfer"] == "bt709"
     assert video["color_primaries"] == "bt709"
+    assert video["pix_fmt"] == pixel_format
     assert not Media.from_probe(probe).hdr
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('processor', ['realesrgan', 'realcugan'])
+def test_real_high_precision_engine_preserves_sub_eight_bit_levels(app, tools, tmp_path, processor):
+    engine = Path(tools['video2x'])
+    if not engine.is_file():
+        pytest.skip('Set ANIME_TEST_VIDEO2X to opt into the Vulkan GPU test')
+    capability = 'rgb16-realcugan-tiled-v1' if processor == 'realcugan' else 'rgb16-realesrgan-v1'
+    if capability not in run([str(engine), '--help']):
+        pytest.skip('High-precision engine capability is required')
+    source, output = tmp_path / 'gradient.mkv', tmp_path / 'high.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i',
+         "nullsrc=s=64x64:r=1:d=1,format=gbrp16le,geq=r='X*950':g='X*950':b='X*950'",
+         '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', str(source)])
+    model_args = ['--realcugan-model', 'models-nose', '--realcugan-syncgap', '0'] if processor == 'realcugan' else ['--realesrgan-model', 'realesr-animevideov3']
+    subprocess.run([str(engine), '-i', str(source), '-o', str(output), '-p', processor, '-d', '0',
+                    '-c', 'ffv1', '--pix-fmt', 'gbrp16le', '--no-copy-audio-streams',
+                    '--no-copy-subtitle-streams', '-s', '2', *model_args, '-n', '0'],
+                   cwd=engine.parent, check=True, capture_output=True, timeout=120,
+                   creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    raw = subprocess.run([tools['ffmpeg'], '-v', 'error', '-i', str(output), '-frames:v', '1',
+                          '-f', 'rawvideo', '-pix_fmt', 'gbrp16le', '-'], check=True, capture_output=True, timeout=30).stdout
+    import array
+    samples = array.array('H'); samples.frombytes(raw)
+    assert len(set(samples)) > 256
+    assert any(value % 257 for value in samples)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('transfer', ['bt709', 'smpte2084', 'arib-std-b67'])
+def test_high_precision_with_watermark_and_burned_subtitles(app, tools, media_files, tmp_path, transfer):
+    engine = Path(tools['video2x'])
+    if not engine.is_file() or 'rgb16-realesrgan-v1' not in run([str(engine), '--help']):
+        pytest.skip('High-precision engine capability is required')
+    source = tmp_path / 'sdr.mkv'
+    primaries, matrix = ('bt709', 'bt709') if transfer == 'bt709' else ('bt2020', 'bt2020nc')
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=96x64:rate=12:duration=1',
+         '-vf', f'setparams=color_primaries={primaries}:color_trc={transfer}:colorspace={matrix}:range=tv',
+         '-c:v', 'libx265', '-preset', 'ultrafast', '-x265-params', f'log-level=error:colorprim={primaries}:transfer={transfer}:colormatrix={matrix}',
+         '-pix_fmt', 'yuv420p10le', '-color_primaries', primaries, '-color_trc', transfer,
+         '-colorspace', matrix, '-color_range', 'tv', str(source)])
+    settings = replace(Settings(), high_precision=True, codec='libx265', pixel_format='yuv420p10le',
+                       target='native', aspect='fit', preset='ultrafast', output_dir=str(tmp_path), copy_subtitles=False,
+                       restoration='mild', flicker='mild',
+                       subtitle_mode='burn', subtitle_path=str(media_files[1]), watermark_path=str(media_files[2]),
+                       watermark_width=32, watermark_margin=4)
+    runner = QueueRunner(); job = runner.enqueue([source], settings)[0]
+    wait_runner(app, runner, tools, timeout=25_000)
+    assert job.state == 'done', job.error
+    data = json.loads(run([tools['ffprobe'], '-v', 'error', '-show_streams', '-of', 'json', str(job.output)]))
+    video = next(st for st in data['streams'] if st['codec_type'] == 'video')
+    assert video['pix_fmt'] == 'yuv420p10le' and video['color_transfer'] == transfer
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('processor', ['realesrgan', 'realcugan', 'rife', 'libplacebo'])
+def test_high_precision_hdr_resume_reuses_verified_16bit_segments(app, tools, tmp_path, monkeypatch, processor):
+    engine = Path(tools['video2x'])
+    capability = {'realcugan': 'rgb16-realcugan-tiled-v1', 'rife': 'rgb16-rife-v4-v1', 'libplacebo': 'rgb16-libplacebo-v1'}.get(processor, 'rgb16-realesrgan-v1')
+    if not engine.is_file() or capability not in run([str(engine), '--help']):
+        pytest.skip('High-precision engine capability is required')
+    monkeypatch.setattr('anime_video_upscaler.runner.RESUME_SEGMENT_SECONDS', 0.25)
+    source = tmp_path / 'hdr-source.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=96x64:rate=12:duration=1',
+         '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1', '-vf',
+         'setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv',
+         '-c:v', 'libx265', '-preset', 'ultrafast', '-x265-params',
+         'log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc',
+         '-pix_fmt', 'yuv420p10le', '-color_primaries', 'bt2020', '-color_trc', 'smpte2084',
+         '-colorspace', 'bt2020nc', '-color_range', 'tv', '-c:a', 'aac', str(source)])
+    settings = replace(Settings(), high_precision=True, engine=processor, cugan_model='models-nose', resume_segments=True, codec='libx265',
+                       pixel_format='yuv420p10le', target='native', aspect='fit', preset='ultrafast',
+                       quality=0, output_dir=str(tmp_path), copy_subtitles=False)
+    runner = QueueRunner(); messages = []; runner.log.connect(messages.append)
+    job = runner.enqueue([source], settings)[0]
+    def interrupt(line):
+        if 'Verified segment 1/' in line and not runner.cancelled:
+            QTimer.singleShot(0, runner.cancel)
+    runner.log.connect(interrupt)
+    wait_runner(app, runner, tools, timeout=120_000)
+    assert job.state == 'cancelled', '\n'.join(messages)
+    runner.log.disconnect(interrupt)
+    segment = next(tmp_path.glob('.anime-resume-*/part-000000.mkv'))
+    metadata = json.loads(run([tools['ffprobe'], '-v', 'error', '-show_streams', '-of', 'json', str(segment)]))
+    assert metadata['streams'][0]['pix_fmt'] == 'gbrp16le'
+    if processor == 'realesrgan':
+        import shutil
+        saved = tmp_path / 'saved-16bit.mkv'
+        invalid = tmp_path / 'invalid-8bit.mkv'
+        shutil.copyfile(segment, saved)
+        run([tools['ffmpeg'], '-v', 'error', '-i', str(segment), '-c:v', 'ffv1', '-pix_fmt', 'bgr0', str(invalid)])
+        os.replace(invalid, segment)
+        job.state, job.percent, job.error = 'queued', 0, ''
+        wait_runner(app, runner, tools, timeout=120_000)
+        assert job.state == 'failed' and 'not 16-bit RGB' in job.error
+        shutil.copyfile(saved, segment)
+    job.state, job.percent, job.error = 'queued', 0, ''
+    wait_runner(app, runner, tools, timeout=120_000)
+    assert job.state == 'done', '\n'.join(messages)
+    assert sum('Verified segment 1/' in line for line in messages) == 2
+    assert not list(tmp_path.glob('.anime-resume-*'))
+    output = json.loads(run([tools['ffprobe'], '-v', 'error', '-show_streams', '-of', 'json', str(job.output)]))
+    video = next(st for st in output['streams'] if st['codec_type'] == 'video')
+    assert video['pix_fmt'] == 'yuv420p10le' and video['color_transfer'] == 'smpte2084'
+    assert any(st['codec_type'] == 'audio' for st in output['streams'])
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('shader', ['anime4k-v4-a', 'anime4k-v4-a+a', 'anime4k-v4-b', 'anime4k-v4-b+b',
+                                    'anime4k-v4-c', 'anime4k-v4-c+a', 'anime4k-v4.1-gan'])
+def test_high_precision_anime4k_distinguishes_sub_eight_bit_inputs(app, tools, tmp_path, shader):
+    import array
+    engine = Path(tools['video2x'])
+    if not engine.is_file() or 'rgb16-libplacebo-v1' not in run([str(engine), '--help']):
+        pytest.skip('High-precision Anime4K capability is required')
+    if not (engine.parent / 'models' / 'libplacebo' / (shader + '.glsl')).is_file():
+        pytest.skip('Shader file is not available')
+    source, output = tmp_path / 'source.mkv', tmp_path / 'output.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i',
+         "nullsrc=s=64x64:r=2:d=1,format=gbrp16le,geq=r='32768+N*48':g='32768+N*48':b='32768+N*48'",
+         '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', str(source)])
+    subprocess.run([str(engine), '-i', str(source), '-o', str(output), '-p', 'libplacebo', '-d', '0', '-c', 'ffv1',
+                    '--pix-fmt', 'gbrp16le', '--no-copy-audio-streams', '--no-copy-subtitle-streams', '-w', '128', '-h', '128',
+                    '--libplacebo-shader', shader, '--no-progress'], cwd=engine.parent,
+                   check=True, capture_output=True, timeout=120, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    raw = subprocess.run([tools['ffmpeg'], '-v', 'error', '-i', str(output), '-f', 'rawvideo', '-pix_fmt', 'gbrp16le', '-'],
+                         check=True, capture_output=True, timeout=30).stdout
+    pixels = array.array('H'); pixels.frombytes(raw); frame_size = 128 * 128 * 3
+    assert len(pixels) == frame_size * 2
+    assert sum(abs(pixels[i + frame_size] - pixels[i]) for i in range(frame_size)) / frame_size > 1
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('model,scale', [('models-se', 3), ('models-se', 4), ('models-pro', 2), ('models-pro', 3)])
+def test_high_precision_cugan_multitile_matches_reference(app, tools, tmp_path, model, scale):
+    import re
+    engine = Path(tools['video2x'])
+    if not engine.is_file() or 'rgb16-realcugan-tiled-v1' not in run([str(engine), '--help']):
+        pytest.skip('Expanded high-precision Real-CUGAN capability is required')
+    source = tmp_path / 'source.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=420x416:r=1:d=1,format=gbrp16le',
+         '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', str(source)])
+    outputs = []
+    for fmt in ('gbrp16le', 'bgr0'):
+        output = tmp_path / (fmt + '.mkv')
+        subprocess.run([str(engine), '-i', str(source), '-o', str(output), '-p', 'realcugan', '-d', '0',
+                        '-c', 'ffv1', '--pix-fmt', fmt, '--no-copy-audio-streams', '--no-copy-subtitle-streams',
+                        '-s', str(scale), '--realcugan-model', model, '--realcugan-syncgap', '0', '-n', '0', '--no-progress'],
+                       cwd=engine.parent, check=True, capture_output=True, timeout=120,
+                       creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        outputs.append(output)
+    result = subprocess.run([tools['ffmpeg'], '-hide_banner', '-i', str(outputs[0]), '-i', str(outputs[1]),
+                             '-lavfi', '[0:v]format=gbrp16le[a];[1:v]format=gbrp16le[b];[a][b]psnr',
+                             '-f', 'null', '-'], check=True, capture_output=True, text=True, timeout=30)
+    match = re.search(r'average:([0-9.]+)', result.stderr)
+    assert match and float(match.group(1)) > (30 if model == 'models-pro' else 40)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('model,scale', [('models-se', 4), ('models-pro', 2)])
+def test_high_precision_cugan_hdr_with_watermark_and_subtitle(app, tools, media_files, tmp_path, model, scale):
+    engine = Path(tools['video2x'])
+    if not engine.is_file() or 'rgb16-realcugan-tiled-v1' not in run([str(engine), '--help']):
+        pytest.skip('Expanded high-precision Real-CUGAN capability is required')
+    source = tmp_path / 'hdr.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=96x64:rate=12:duration=1',
+         '-vf', 'setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv',
+         '-c:v', 'libx265', '-preset', 'ultrafast', '-x265-params',
+         'log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400',
+         '-pix_fmt', 'yuv420p10le', '-color_primaries', 'bt2020', '-color_trc', 'smpte2084',
+         '-colorspace', 'bt2020nc', '-color_range', 'tv', str(source)])
+    settings = replace(Settings(), engine='realcugan', cugan_model=model, cugan_syncgap=0, scale=scale, noise=0,
+                       high_precision=True, codec='libx265', pixel_format='yuv420p10le', target='native', aspect='fit',
+                       preset='ultrafast', output_dir=str(tmp_path), copy_subtitles=False, subtitle_mode='burn',
+                       subtitle_path=str(media_files[1]), watermark_path=str(media_files[2]), watermark_width=32, watermark_margin=4)
+    runner = QueueRunner(); job = runner.enqueue([source], settings)[0]
+    wait_runner(app, runner, tools, timeout=60_000)
+    assert job.state == 'done', job.error
+    data = json.loads(run([tools['ffprobe'], '-v', 'error', '-count_frames', '-show_streams', '-of', 'json', str(job.output)]))
+    video = next(st for st in data['streams'] if st['codec_type'] == 'video')
+    assert video['pix_fmt'] == 'yuv420p10le' and video['color_transfer'] == 'smpte2084' and int(video['nb_read_frames']) == 12
+    import array
+    raw = subprocess.run([tools['ffmpeg'], '-v', 'error', '-i', str(job.output), '-frames:v', '1',
+                          '-pix_fmt', 'yuv420p10le', '-f', 'rawvideo', '-'], check=True, capture_output=True, timeout=30).stdout
+    pixels = array.array('H'); pixels.frombytes(raw)
+    assert len(set(pixels)) > 256
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('model,scale,noise', [
+    ('realesr-animevideov3', 2, 0), ('realesr-animevideov3', 3, 0),
+    ('realesr-animevideov3', 4, 0), ('realesrgan-plus-anime', 4, 0),
+    ('realesrgan-plus', 4, 0), ('realesr-generalv3', 4, 0), ('realesr-generalv3', 4, 1),
+])
+def test_high_precision_realesrgan_models_match_standard_path(app, tools, tmp_path, model, scale, noise):
+    import array
+    import re
+    engine = Path(tools['video2x'])
+    if not engine.is_file() or 'rgb16-realesrgan-v1' not in run([str(engine), '--help']):
+        pytest.skip('High-precision Real-ESRGAN capability is required')
+    suffix = '-wdn' if model == 'realesr-generalv3' and noise > 0 else ''
+    if not (engine.parent / 'models' / 'realesrgan' / f'{model}{suffix}-x{scale}.bin').is_file():
+        pytest.skip('Model files are not available')
+    source = tmp_path / 'source.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=96x64:r=1:d=1,format=gbrp16le',
+         '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', str(source)])
+    outputs = []
+    for fmt in ('gbrp16le', 'bgr0'):
+        output = tmp_path / (fmt + '.mkv')
+        subprocess.run([str(engine), '-i', str(source), '-o', str(output), '-p', 'realesrgan', '-d', '0',
+                        '-c', 'ffv1', '--pix-fmt', fmt, '--no-copy-audio-streams', '--no-copy-subtitle-streams',
+                        '-s', str(scale), '--realesrgan-model', model, '-n', str(noise), '--no-progress'],
+                       cwd=engine.parent, check=True, capture_output=True, timeout=120,
+                       creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        outputs.append(output)
+    raw = subprocess.run([tools['ffmpeg'], '-v', 'error', '-i', str(outputs[0]), '-frames:v', '1',
+                          '-pix_fmt', 'gbrp16le', '-f', 'rawvideo', '-'], check=True, capture_output=True, timeout=30).stdout
+    pixels = array.array('H'); pixels.frombytes(raw)
+    assert len(set(pixels)) > 256
+    result = subprocess.run([tools['ffmpeg'], '-hide_banner', '-i', str(outputs[0]), '-i', str(outputs[1]),
+                             '-lavfi', '[0:v]format=gbrp16le[a];[1:v]format=gbrp16le[b];[a][b]psnr',
+                             '-f', 'null', '-'], check=True, capture_output=True, text=True, timeout=30)
+    match = re.search(r'average:([0-9.]+)', result.stderr)
+    assert match and float(match.group(1)) > 40
+
+
+@pytest.mark.gpu
+def test_cugan_pro_2x_completes_without_black_frame_warning(app, tools, media_files):
+    engine = Path(tools['video2x'])
+    if not engine.is_file():
+        pytest.skip('Vulkan GPU test requires an engine')
+    settings = replace(Settings(), engine='realcugan', cugan_model='models-pro', scale=2, noise=0,
+                       target='native', aspect='fit', preset='ultrafast', copy_subtitles=False)
+    runner = QueueRunner(); job = runner.enqueue([media_files[0]], settings)[0]
+    wait_runner(app, runner, tools, timeout=120_000)
+    assert job.state == 'done' and 'black frames' not in job.error
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('model,scale,noise', [
+    ('models-nose', 2, 0), ('models-se', 2, 0), ('models-se', 2, 3),
+    ('models-se', 3, 0), ('models-se', 4, 0), ('models-se', 4, 3),
+    ('models-pro', 2, 0), ('models-pro', 2, -1), ('models-pro', 2, 3),
+    ('models-pro', 3, 0), ('models-pro', 3, -1), ('models-pro', 3, 3),
+])
+def test_high_precision_cugan_models_match_standard_path(app, tools, tmp_path, model, scale, noise):
+    import array
+    import re
+    engine = Path(tools['video2x'])
+    if not engine.is_file() or 'rgb16-realcugan-tiled-v1' not in run([str(engine), '--help']):
+        pytest.skip('Expanded high-precision Real-CUGAN capability is required')
+    source = tmp_path / 'source.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=96x64:r=1:d=1,format=gbrp16le',
+         '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', str(source)])
+    outputs = []
+    for fmt in ('gbrp16le', 'bgr0'):
+        output = tmp_path / (fmt + '.mkv')
+        subprocess.run([str(engine), '-i', str(source), '-o', str(output), '-p', 'realcugan', '-d', '0',
+                        '-c', 'ffv1', '--pix-fmt', fmt, '--no-copy-audio-streams', '--no-copy-subtitle-streams',
+                        '-s', str(scale), '--realcugan-model', model, '--realcugan-syncgap', '0', '-n', str(noise), '--no-progress'],
+                       cwd=engine.parent, check=True, capture_output=True, timeout=120,
+                       creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        outputs.append(output)
+    raw = subprocess.run([tools['ffmpeg'], '-v', 'error', '-i', str(outputs[0]), '-frames:v', '1',
+                          '-pix_fmt', 'gbrp16le', '-f', 'rawvideo', '-'], check=True, capture_output=True, timeout=30).stdout
+    pixels = array.array('H'); pixels.frombytes(raw)
+    assert len(set(pixels)) > 256
+    result = subprocess.run([tools['ffmpeg'], '-hide_banner', '-i', str(outputs[0]), '-i', str(outputs[1]),
+                             '-lavfi', '[0:v]format=gbrp16le[a];[1:v]format=gbrp16le[b];[a][b]psnr',
+                             '-f', 'null', '-'], check=True, capture_output=True, text=True, timeout=30)
+    match = re.search(r'average:([0-9.]+)', result.stderr)
+    assert match and float(match.group(1)) > (30 if model == 'models-pro' else 40)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('engine,model,syncgap,uhd', [('rife', 'rife-v2', 0, False), ('rife', 'rife-v2', 0, True),
+                                                     ('rife', 'rife-v4.26', 0, True), ('realcugan', 'models-pro', 3, False)])
+def test_hdr_legacy_rife_and_synchronized_cugan_end_to_end(app, tools, media_files, tmp_path, engine, model, syncgap, uhd):
+    native = Path(tools['video2x'])
+    capability = ('rgb16-rife-uhd-v1' if uhd else 'rgb16-rife-legacy-v1') if engine == 'rife' else 'rgb16-realcugan-sync-v1'
+    if not native.is_file() or capability not in run([str(native), '--help']):
+        pytest.skip('Updated high-precision engine is required')
+    source = tmp_path / 'hdr-source.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=96x64:rate=2:duration=1',
+         '-vf', 'setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv',
+         '-c:v', 'libx265', '-preset', 'ultrafast', '-x265-params',
+         'log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400',
+         '-pix_fmt', 'yuv420p10le', '-color_primaries', 'bt2020', '-color_trc', 'smpte2084',
+         '-colorspace', 'bt2020nc', '-color_range', 'tv', str(source)])
+    settings = replace(Settings(), engine=engine, rife_model=model if engine == 'rife' else 'rife-v4.26',
+                       cugan_model=model if engine == 'realcugan' else 'models-se', cugan_syncgap=syncgap,
+                       scale=2, noise=0, rife_uhd=uhd, high_precision=True, codec='libx265', pixel_format='yuv420p10le',
+                       target='native', aspect='fit', preset='ultrafast', output_dir=str(tmp_path), copy_subtitles=False,
+                       subtitle_mode='burn', subtitle_path=str(media_files[1]), watermark_path=str(media_files[2]),
+                       watermark_width=32, watermark_margin=4)
+    runner = QueueRunner(); job = runner.enqueue([source], settings)[0]
+    wait_runner(app, runner, tools, timeout=120_000)
+    assert job.state == 'done', job.error
+    info = json.loads(run([tools['ffprobe'], '-v', 'error', '-show_streams', '-of', 'json', str(job.output)]))
+    video = next(stream for stream in info['streams'] if stream['codec_type'] == 'video')
+    assert video['pix_fmt'] == 'yuv420p10le' and video['color_transfer'] == 'smpte2084'
+    frames = json.loads(run([tools['ffprobe'], '-v', 'error', '-read_intervals', '%+#1', '-select_streams', 'v:0',
+                             '-show_frames', '-show_entries', 'frame=side_data_list', '-of', 'json', str(job.output)]))
+    kinds = {item['side_data_type'] for item in frames['frames'][0].get('side_data_list', [])}
+    assert {'Mastering display metadata', 'Content light level metadata'} <= kinds
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('model', ['rife', 'rife-anime', 'rife-HD', 'rife-UHD', 'rife-v2', 'rife-v2.3',
+                                   'rife-v2.4', 'rife-v3.0', 'rife-v3.1', 'rife-v4', 'rife-v4.6',
+                                   'rife-v4.25', 'rife-v4.25-lite', 'rife-v4.26'])
+def test_high_precision_rife_uhd_is_repeatable(app, tools, tmp_path, model):
+    import array
+    engine = Path(tools['video2x'])
+    if not engine.is_file() or 'rgb16-rife-uhd-v1' not in run([str(engine), '--help']):
+        pytest.skip('High-precision RIFE UHD capability is required')
+    if not (engine.parent / 'models' / 'rife' / model).is_dir():
+        pytest.skip('Model files are not available')
+    source = tmp_path / 'source.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=96x64:r=2:d=1,format=gbrp16le',
+         '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', str(source)])
+    frames = []
+    for attempt in range(2):
+        output = tmp_path / f'{attempt}.mkv'
+        subprocess.run([str(engine), '-i', str(source), '-o', str(output), '-p', 'rife', '-d', '0', '-c', 'ffv1',
+                        '--pix-fmt', 'gbrp16le', '--no-copy-audio-streams', '--no-copy-subtitle-streams', '-m', '2',
+                        '-t', '100', '--rife-model', model, '--rife-uhd', '--no-progress'], cwd=engine.parent,
+                       check=True, capture_output=True, timeout=120, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        raw = subprocess.run([tools['ffmpeg'], '-v', 'error', '-i', str(output), '-vf', r'select=eq(n\,1)',
+                              '-frames:v', '1', '-pix_fmt', 'gbrp16le', '-f', 'rawvideo', '-'],
+                             check=True, capture_output=True, timeout=30).stdout
+        pixels = array.array('H'); pixels.frombytes(raw); frames.append(pixels)
+    assert len(frames[0]) == 96 * 64 * 3 and len(set(frames[0])) > 256
+    assert any(value % 257 for value in frames[0])
+    assert frames[0] == frames[1]
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('model', ['rife', 'rife-anime', 'rife-HD', 'rife-UHD', 'rife-v2', 'rife-v2.3',
+                                   'rife-v2.4', 'rife-v3.0', 'rife-v3.1'])
+def test_high_precision_legacy_rife_matches_standard_and_keeps_detail(app, tools, tmp_path, model):
+    import array
+    import re
+    engine = Path(tools['video2x'])
+    if not engine.is_file() or 'rgb16-rife-legacy-v1' not in run([str(engine), '--help']):
+        pytest.skip('High-precision legacy RIFE capability is required')
+    if not (engine.parent / 'models' / 'rife' / model).is_dir():
+        pytest.skip('Model files are not available')
+    source = tmp_path / 'source.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=96x64:r=2:d=1,format=gbrp16le',
+         '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', str(source)])
+    outputs = []
+    for fmt in ('gbrp16le', 'bgr0'):
+        output = tmp_path / (fmt + '.mkv')
+        subprocess.run([str(engine), '-i', str(source), '-o', str(output), '-p', 'rife', '-d', '0', '-c', 'ffv1',
+                        '--pix-fmt', fmt, '--no-copy-audio-streams', '--no-copy-subtitle-streams', '-m', '2',
+                        '-t', '100', '--rife-model', model, '--no-progress'], cwd=engine.parent,
+                       check=True, capture_output=True, timeout=120, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        outputs.append(output)
+    raw = subprocess.run([tools['ffmpeg'], '-v', 'error', '-i', str(outputs[0]), '-vf', r'select=eq(n\,1)',
+                          '-frames:v', '1', '-pix_fmt', 'gbrp16le', '-f', 'rawvideo', '-'],
+                         check=True, capture_output=True, timeout=30).stdout
+    values = array.array('H'); values.frombytes(raw)
+    assert len(set(values)) > 256 and any(value % 257 for value in values)
+    result = subprocess.run([tools['ffmpeg'], '-hide_banner', '-i', str(outputs[0]), '-i', str(outputs[1]),
+                             '-lavfi', '[0:v]format=gbrp16le[a];[1:v]format=gbrp16le[b];[a][b]psnr',
+                             '-f', 'null', '-'], check=True, capture_output=True, text=True, timeout=30)
+    match = re.search(r'average:([0-9.]+)', result.stderr)
+    assert match and float(match.group(1)) > 30
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('uhd', [False, True])
+@pytest.mark.parametrize('multiplier', [3, 4])
+def test_high_precision_legacy_rife_multiple_intermediate_times(app, tools, tmp_path, multiplier, uhd):
+    import array
+    engine = Path(tools['video2x'])
+    capability = 'rgb16-rife-uhd-v1' if uhd else 'rgb16-rife-legacy-v1'
+    if not engine.is_file() or capability not in run([str(engine), '--help']):
+        pytest.skip('High-precision legacy RIFE capability is required')
+    source, output = tmp_path / 'source.mkv', tmp_path / 'output.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=96x64:r=2:d=1,format=gbrp16le',
+         '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', str(source)])
+    subprocess.run([str(engine), '-i', str(source), '-o', str(output), '-p', 'rife', '-d', '0', '-c', 'ffv1',
+                    '--pix-fmt', 'gbrp16le', '--no-copy-audio-streams', '--no-copy-subtitle-streams', '-m', str(multiplier),
+                    '-t', '100', '--rife-model', 'rife-v2', '--no-progress'] + (['--rife-uhd'] if uhd else []), cwd=engine.parent,
+                   check=True, capture_output=True, timeout=180, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    raw = subprocess.run([tools['ffmpeg'], '-v', 'error', '-i', str(output), '-pix_fmt', 'gbrp16le', '-f', 'rawvideo', '-'],
+                         check=True, capture_output=True, timeout=30).stdout
+    values = array.array('H'); values.frombytes(raw); size = 96 * 64 * 3
+    assert len(values) == (multiplier + 1) * size
+    assert sum(abs(values[size + i] - values[2 * size + i]) for i in range(size)) > size
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('uhd', [False, True])
+def test_high_precision_legacy_rife_distinguishes_sub_eight_bit_inputs(app, tools, tmp_path, uhd):
+    import array
+    engine = Path(tools['video2x'])
+    capability = 'rgb16-rife-uhd-v1' if uhd else 'rgb16-rife-legacy-v1'
+    if not engine.is_file() or capability not in run([str(engine), '--help']):
+        pytest.skip('High-precision legacy RIFE capability is required')
+    frames = []
+    for offset in (0, 48):
+        source, output = tmp_path / f'source{offset}.mkv', tmp_path / f'output{offset}.mkv'
+        expression = f"nullsrc=s=64x64:r=2:d=1,format=gbrp16le,geq=r='32768+{offset}':g='32768+{offset}':b='32768+{offset}'"
+        run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', expression, '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', str(source)])
+        subprocess.run([str(engine), '-i', str(source), '-o', str(output), '-p', 'rife', '-d', '0', '-c', 'ffv1',
+                        '--pix-fmt', 'gbrp16le', '--no-copy-audio-streams', '--no-copy-subtitle-streams', '-m', '2',
+                        '-t', '100', '--rife-model', 'rife-v2', '--no-progress'] + (['--rife-uhd'] if uhd else []), cwd=engine.parent,
+                       check=True, capture_output=True, timeout=120, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        raw = subprocess.run([tools['ffmpeg'], '-v', 'error', '-i', str(output), '-vf', r'select=eq(n\,1)',
+                              '-frames:v', '1', '-pix_fmt', 'gbrp16le', '-f', 'rawvideo', '-'],
+                             check=True, capture_output=True, timeout=30).stdout
+        values = array.array('H'); values.frombytes(raw); frames.append(values)
+    assert len(frames[0]) == len(frames[1]) == 64 * 64 * 3
+    assert sum(abs(a - b) for a, b in zip(*frames)) / len(frames[0]) > 1
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('syncgap', [1, 2, 3])
+@pytest.mark.parametrize('model,scale', [('models-se', 2), ('models-se', 4), ('models-pro', 2), ('models-pro', 3)])
+def test_high_precision_cugan_sync_modes_match_standard(app, tools, tmp_path, syncgap, model, scale):
+    import array
+    import re
+    engine = Path(tools['video2x'])
+    if not engine.is_file() or 'rgb16-realcugan-sync-v1' not in run([str(engine), '--help']):
+        pytest.skip('High-precision synchronized Real-CUGAN is required')
+    source = tmp_path / 'source.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=420x416:r=1:d=1,format=gbrp16le',
+         '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', str(source)])
+    outputs = []
+    for fmt in ('gbrp16le', 'bgr0'):
+        output = tmp_path / (fmt + '.mkv')
+        subprocess.run([str(engine), '-i', str(source), '-o', str(output), '-p', 'realcugan', '-d', '0',
+                        '-c', 'ffv1', '--pix-fmt', fmt, '--no-copy-audio-streams', '--no-copy-subtitle-streams',
+                        '-s', str(scale), '--realcugan-model', model, '--realcugan-syncgap', str(syncgap),
+                        '-n', '0', '--no-progress'], cwd=engine.parent, check=True, capture_output=True, timeout=180,
+                       creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        outputs.append(output)
+    raw = subprocess.run([tools['ffmpeg'], '-v', 'error', '-i', str(outputs[0]), '-frames:v', '1',
+                          '-pix_fmt', 'gbrp16le', '-f', 'rawvideo', '-'], check=True, capture_output=True, timeout=30).stdout
+    values = array.array('H'); values.frombytes(raw)
+    assert len(set(values)) > 256 and any(value % 257 for value in values)
+    result = subprocess.run([tools['ffmpeg'], '-hide_banner', '-i', str(outputs[0]), '-i', str(outputs[1]),
+                             '-lavfi', '[0:v]format=gbrp16le[a];[1:v]format=gbrp16le[b];[a][b]psnr',
+                             '-f', 'null', '-'], check=True, capture_output=True, text=True, timeout=30)
+    match = re.search(r'average:([0-9.]+)', result.stderr)
+    assert match and float(match.group(1)) > (30 if model == 'models-pro' else 35)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('width,height', [(420, 64), (64, 420)])
+@pytest.mark.parametrize('fmt', ['bgr0', 'gbrp16le'])
+def test_cugan_narrow_tiled_frames_use_stable_rough_mode(app, tools, tmp_path, width, height, fmt):
+    engine = Path(tools['video2x'])
+    if not engine.is_file() or 'rgb16-realcugan-sync-v1' not in run([str(engine), '--help']):
+        pytest.skip('Updated synchronized Real-CUGAN engine is required')
+    source = tmp_path / 'source.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', f'testsrc2=s={width}x{height}:r=1:d=1,format=gbrp16le',
+         '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', str(source)])
+    frames = []
+    for mode in (2, 3):
+        output = tmp_path / f'{mode}.mkv'
+        subprocess.run([str(engine), '-i', str(source), '-o', str(output), '-p', 'realcugan', '-d', '0',
+                        '-c', 'ffv1', '--pix-fmt', fmt, '--no-copy-audio-streams', '--no-copy-subtitle-streams',
+                        '-s', '2', '--realcugan-model', 'models-se', '--realcugan-syncgap', str(mode),
+                        '-n', '0', '--no-progress'], cwd=engine.parent, check=True, capture_output=True, timeout=180,
+                       creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        frames.append(subprocess.run([tools['ffmpeg'], '-v', 'error', '-i', str(output), '-frames:v', '1',
+                                      '-pix_fmt', fmt, '-f', 'rawvideo', '-'], check=True, capture_output=True, timeout=30).stdout)
+    assert frames[0] == frames[1] and frames[0]
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('fmt', ['bgr0', 'gbrp16le'])
+def test_cugan_pro_very_rough_uses_stable_rough_mode(app, tools, tmp_path, fmt):
+    engine = Path(tools['video2x'])
+    if not engine.is_file() or 'realcugan-pro-range-v1' not in run([str(engine), '--help']):
+        pytest.skip('Updated Real-CUGAN Pro engine is required')
+    source = tmp_path / 'source.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=420x416:r=1:d=1,format=gbrp16le',
+         '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', str(source)])
+    frames = []
+    for mode in (2, 3):
+        output = tmp_path / f'{mode}.mkv'
+        subprocess.run([str(engine), '-i', str(source), '-o', str(output), '-p', 'realcugan', '-d', '0',
+                        '-c', 'ffv1', '--pix-fmt', fmt, '--no-copy-audio-streams', '--no-copy-subtitle-streams',
+                        '-s', '2', '--realcugan-model', 'models-pro', '--realcugan-syncgap', str(mode),
+                        '-n', '0', '--no-progress'], cwd=engine.parent, check=True, capture_output=True, timeout=180,
+                       creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        frames.append(subprocess.run([tools['ffmpeg'], '-v', 'error', '-i', str(output), '-frames:v', '1',
+                                      '-pix_fmt', fmt, '-f', 'rawvideo', '-'], check=True, capture_output=True, timeout=30).stdout)
+    assert frames[0] == frames[1] and frames[0]
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('model', ['rife-v4', 'rife-v4.6', 'rife-v4.25', 'rife-v4.25-lite', 'rife-v4.26'])
+def test_high_precision_rife_v4_model_variants(app, tools, tmp_path, model):
+    engine = Path(tools['video2x'])
+    if not engine.is_file() or 'rgb16-rife-v4-v1' not in run([str(engine), '--help']):
+        pytest.skip('High-precision RIFE v4 capability is required')
+    if not (engine.parent / 'models' / 'rife' / model).is_dir():
+        pytest.skip('Model files are not available')
+    source, output = tmp_path / 'source.mkv', tmp_path / 'output.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=96x64:r=2:d=1,format=gbrp16le',
+         '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', str(source)])
+    subprocess.run([str(engine), '-i', str(source), '-o', str(output), '-p', 'rife', '-d', '0', '-c', 'ffv1',
+                    '--pix-fmt', 'gbrp16le', '--no-copy-audio-streams', '--no-copy-subtitle-streams', '-m', '2',
+                    '-t', '100', '--rife-model', model, '--no-progress'], cwd=engine.parent,
+                   check=True, capture_output=True, timeout=120, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    info = json.loads(run([tools['ffprobe'], '-v', 'error', '-count_frames', '-show_streams', '-of', 'json', str(output)]))
+    video = info['streams'][0]
+    assert video['pix_fmt'] == 'gbrp16le' and int(video['nb_read_frames']) == 3
+
+
+@pytest.mark.gpu
+def test_high_precision_rife_produces_interpolated_sixteen_bit_frames(app, tools, tmp_path):
+    import array
+    import re
+    engine = Path(tools['video2x'])
+    if not engine.is_file() or 'rgb16-rife-v4-v1' not in run([str(engine), '--help']):
+        pytest.skip('High-precision RIFE v4 capability is required')
+    source = tmp_path / 'source.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=96x64:r=2:d=1,format=gbrp16le',
+         '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', str(source)])
+    outputs = []
+    for fmt in ('gbrp16le', 'bgr0'):
+        output = tmp_path / (fmt + '.mkv')
+        subprocess.run([str(engine), '-i', str(source), '-o', str(output), '-p', 'rife', '-d', '0', '-c', 'ffv1',
+                        '--pix-fmt', fmt, '--no-copy-audio-streams', '--no-copy-subtitle-streams', '-m', '2', '-t', '100',
+                        '--rife-model', 'rife-v4.26', '--no-progress'], cwd=engine.parent, check=True,
+                       capture_output=True, timeout=120, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        outputs.append(output)
+    raw = subprocess.run([tools['ffmpeg'], '-v', 'error', '-i', str(outputs[0]), '-vf', 'select=eq(n\\,1)',
+                          '-frames:v', '1', '-pix_fmt', 'gbrp16le', '-f', 'rawvideo', '-'],
+                         check=True, capture_output=True, timeout=30).stdout
+    values = array.array('H'); values.frombytes(raw)
+    assert len(set(values)) > 256 and any(value % 257 for value in values)
+    result = subprocess.run([tools['ffmpeg'], '-hide_banner', '-i', str(outputs[0]), '-i', str(outputs[1]),
+                             '-lavfi', '[0:v]format=gbrp16le[a];[1:v]format=gbrp16le[b];[a][b]psnr',
+                             '-f', 'null', '-'], check=True, capture_output=True, text=True, timeout=30)
+    match = re.search(r'average:([0-9.]+)', result.stderr)
+    assert match and float(match.group(1)) > 40
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('processor', ['realesrgan', 'realcugan'])
+def test_high_precision_tiles_are_consistent_with_standard_model(app, tools, tmp_path, processor):
+    import re
+    engine = Path(tools['video2x'])
+    capability = 'rgb16-realcugan-tiled-v1' if processor == 'realcugan' else 'rgb16-realesrgan-v1'
+    if not engine.is_file() or capability not in run([str(engine), '--help']):
+        pytest.skip('High-precision engine capability is required')
+    source = tmp_path / 'tile-input.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=420x416:r=1:d=1,format=gbrp16le',
+         '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', str(source)])
+    outputs = []
+    for fmt in ('gbrp16le', 'bgr0'):
+        output = tmp_path / (fmt + '.mkv')
+        model_args = ['--realcugan-model', 'models-nose', '--realcugan-syncgap', '0'] if processor == 'realcugan' else ['--realesrgan-model', 'realesr-animevideov3']
+        subprocess.run([str(engine), '-i', str(source), '-o', str(output), '-p', processor, '-d', '0',
+                        '-c', 'ffv1', '--pix-fmt', fmt, '--no-copy-audio-streams', '--no-copy-subtitle-streams',
+                        '-s', '2', *model_args, '-n', '0', '--no-progress'],
+                       cwd=engine.parent, check=True, capture_output=True, timeout=120,
+                       creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        outputs.append(output)
+    result = subprocess.run([tools['ffmpeg'], '-hide_banner', '-i', str(outputs[0]), '-i', str(outputs[1]),
+                             '-lavfi', '[0:v]format=gbrp16le[a];[1:v]format=gbrp16le[b];[a][b]psnr',
+                             '-f', 'null', '-'], check=True, capture_output=True, text=True, timeout=30)
+    match = re.search(r'average:([0-9.]+)', result.stderr)
+    assert match and float(match.group(1)) > 40
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('processor', ['realesrgan', 'realcugan', 'rife', 'libplacebo'])
+@pytest.mark.parametrize('transfer', ['bt709', 'smpte2084', 'arib-std-b67'])
+def test_high_precision_ai_retains_tagged_color_and_ten_bit_output(app, tools, tmp_path, transfer, processor):
+    engine = Path(tools['video2x'])
+    capability = {'realcugan': 'rgb16-realcugan-tiled-v1', 'rife': 'rgb16-rife-v4-v1', 'libplacebo': 'rgb16-libplacebo-v1'}.get(processor, 'rgb16-realesrgan-v1')
+    if not engine.is_file() or capability not in run([str(engine), '--help']):
+        pytest.skip('High-precision engine capability is required')
+    hdr = transfer != 'bt709'
+    primaries, matrix = ('bt2020', 'bt2020nc') if hdr else ('bt709', 'bt709')
+    source = tmp_path / 'source.mkv'
+    x265_options = f'log-level=error:colorprim={primaries}:transfer={transfer}:colormatrix={matrix}'
+    if hdr:
+        x265_options += ':master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=96x64:rate=12:duration=0.5',
+         '-vf', f'setparams=color_primaries={primaries}:color_trc={transfer}:colorspace={matrix}:range=tv',
+         '-c:v', 'libx265', '-preset', 'ultrafast', '-x265-params', x265_options,
+         '-pix_fmt', 'yuv420p10le', '-color_primaries', primaries, '-color_trc', transfer,
+         '-colorspace', matrix, '-color_range', 'tv', str(source)])
+    settings = replace(Settings(), high_precision=True, engine=processor, cugan_model='models-nose', codec='libx265', pixel_format='yuv420p10le',
+                       target='native', aspect='fit', preset='ultrafast', output_dir=str(tmp_path), copy_subtitles=False,
+                       restoration='mild' if transfer == 'smpte2084' else 'off',
+                       flicker='mild' if transfer == 'smpte2084' else 'off')
+    runner = QueueRunner(); job = runner.enqueue([source], settings)[0]
+    wait_runner(app, runner, tools, timeout=120_000)
+    assert job.state == 'done', job.error
+    output = json.loads(run([tools['ffprobe'], '-v', 'error', '-show_streams', '-of', 'json', str(job.output)]))
+    video = next(item for item in output['streams'] if item['codec_type'] == 'video')
+    assert (video['pix_fmt'], video['color_primaries'], video['color_transfer'], video['color_space']) == ('yuv420p10le', primaries, transfer, matrix)
+    if hdr:
+        def first_frame(path):
+            data = json.loads(run([tools['ffprobe'], '-v', 'error', '-read_intervals', '%+#1', '-select_streams', 'v:0',
+                                   '-show_frames', '-show_entries', 'frame=side_data_list', '-of', 'json', str(path)]))
+            return data['frames'][0].get('side_data_list', [])
+        source_metadata = {item['side_data_type']: item for item in first_frame(source)
+                           if item.get('side_data_type') in ('Mastering display metadata', 'Content light level metadata')}
+        output_metadata = {item['side_data_type']: item for item in first_frame(job.output)
+                           if item.get('side_data_type') in ('Mastering display metadata', 'Content light level metadata')}
+        assert set(source_metadata) == {'Mastering display metadata', 'Content light level metadata'}
+        assert output_metadata == source_metadata
+    if transfer == 'smpte2084':
+        from anime_video_upscaler.comparison import CompareDialog
+        from anime_video_upscaler.gui import SettingsStore
+        probe = json.loads(run([tools['ffprobe'], '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(source)]))
+        dialog = CompareDialog(source, Media.from_probe(probe), 0, settings, tools, lambda text: text, SettingsStore)
+        dialog.length.setValue(.5)
+        loop = QEventLoop(); timer = QTimer(); timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+        dialog.runner.busy_changed.connect(lambda busy: loop.quit() if not busy else None)
+        timer.start(120_000); dialog.start(); loop.exec(); timer.stop()
+        assert dialog.job and dialog.job.state == 'done', dialog.job.error if dialog.job else 'sample did not start'
+        result = json.loads(run([tools['ffprobe'], '-v', 'error', '-show_streams', '-of', 'json', str(dialog.job.output)]))
+        assert next(st for st in result['streams'] if st['codec_type'] == 'video')['color_transfer'] == 'smpte2084'
+        dialog.reject()
 
 
 @pytest.mark.gpu

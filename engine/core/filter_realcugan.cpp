@@ -1,5 +1,7 @@
 #include "filter_realcugan.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -99,10 +101,18 @@ int FilterRealcugan::init(AVCodecContext* dec_ctx, AVCodecContext* enc_ctx, AVBu
     if (model_name_.find(STR("models-nose")) != fsutils::StringType::npos) {
         syncgap_ = 0;
     }
+    // Very-rough synchronization samples small tiles. Pro models can become
+    // numerically unstable on those samples, so use the rough full-tile
+    // synchronization instead for both 8-bit and high-precision processing.
+    if (model_name_ == STR("models-pro") && syncgap_ == 3) {
+        logger()->info("Real-CUGAN Pro uses sync gap 2 instead of 3 for stability");
+        syncgap_ = 2;
+    }
 
     // The underlying implementation reads this field when processing tiled
     // images. Leaving it uninitialized ignores the user's selected mode.
     realcugan_->syncgap = syncgap_;
+    realcugan_->pro_mode = model_name_ == STR("models-pro");
 
     // Set realcugan parameters
     realcugan_->scale = scaling_factor_;
@@ -162,17 +172,50 @@ int FilterRealcugan::init(AVCodecContext* dec_ctx, AVCodecContext* enc_ctx, AVBu
         }
     }
 
+    // The very-rough sampler requires at least three 32-pixel rows and
+    // columns. On a long, narrow frame it would otherwise have no samples.
+    if (realcugan_->syncgap == 3 &&
+        (dec_ctx->width <= 64 || dec_ctx->height <= 64) &&
+        std::max(dec_ctx->width, dec_ctx->height) > realcugan_->tilesize) {
+        logger()->info("Real-CUGAN uses sync gap 2 for a narrow tiled frame");
+        realcugan_->syncgap = 2;
+    }
+
     return 0;
 }
 
 int FilterRealcugan::filter(AVFrame* in_frame, AVFrame** out_frame) {
     int ret;
 
+    if (in_frame->format == AV_PIX_FMT_GBRP16LE && out_pix_fmt_ == AV_PIX_FMT_GBRP16LE) {
+        ncnn::Mat input = conversions::gbrp16_to_ncnn_float(in_frame);
+        if (input.empty()) return AVERROR(ENOMEM);
+        ncnn::Mat output(input.w * realcugan_->scale, input.h * realcugan_->scale, 3, (size_t)4u);
+        if (output.empty()) return AVERROR(ENOMEM);
+        ret = realcugan_->process_float(input, output);
+        if (ret != 0) return ret;
+        *out_frame = conversions::ncnn_float_to_gbrp16(output);
+        if (!*out_frame) return AVERROR(ENOMEM);
+        av_frame_copy_props(*out_frame, in_frame);
+        (*out_frame)->pts = av_rescale_q(in_frame->pts, in_time_base_, out_time_base_);
+        return 0;
+    }
+
     // Convert the input frame to RGB24
     ncnn::Mat in_mat = conversions::avframe_to_ncnn_mat(in_frame);
     if (in_mat.empty()) {
         logger()->error("Failed to convert AVFrame to ncnn::Mat");
         return -1;
+    }
+
+    // Pro models were trained with input compressed to [0.15, 0.85].
+    // Apply this for the packed 8-bit path as well as process_float, including
+    // the synchronized tiled variants, then undo it after inference.
+    if (realcugan_->pro_mode) {
+        auto* pixels = static_cast<unsigned char*>(in_mat.data);
+        const size_t count = static_cast<size_t>(in_mat.w) * in_mat.h * 3;
+        for (size_t i = 0; i < count; ++i)
+            pixels[i] = static_cast<unsigned char>(std::lround(pixels[i] * 0.7f + 38.25f));
     }
 
     // Allocate space for output ncnn::Mat
@@ -184,6 +227,15 @@ int FilterRealcugan::filter(AVFrame* in_frame, AVFrame** out_frame) {
     if (ret != 0) {
         logger()->error("Real-CUGAN processing failed");
         return ret;
+    }
+
+    if (realcugan_->pro_mode) {
+        auto* pixels = static_cast<unsigned char*>(out_mat.data);
+        const size_t count = static_cast<size_t>(out_mat.w) * out_mat.h * 3;
+        for (size_t i = 0; i < count; ++i) {
+            const int value = static_cast<int>(std::lround((pixels[i] - 38.25f) / 0.7f));
+            pixels[i] = static_cast<unsigned char>(std::clamp(value, 0, 255));
+        }
     }
 
     // Convert ncnn::Mat to AVFrame

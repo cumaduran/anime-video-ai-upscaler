@@ -34,6 +34,43 @@ def test_basic_and_advanced_share_encoder_state(app):
     advanced.deleteLater()
 
 
+def test_engine_controls_are_clickable_and_select_their_engine(app):
+    from PySide6.QtTest import QTest
+    store = SettingsStore()
+    form = SettingsForm(store, ['shader', 'rife_uhd', 'cugan_model', 'model'], Translator())
+    form.resize(700, 300); form.show(); app.processEvents()
+    shader = form.controls['shader']
+    assert shader.isEnabled()
+    QTest.mouseClick(shader, Qt.MouseButton.LeftButton, pos=shader.rect().center())
+    app.processEvents()
+    assert store.value.engine == 'libplacebo'
+    shader.hidePopup()
+    checkbox = form.controls['rife_uhd']
+    assert checkbox.isEnabled()
+    QTest.mouseClick(checkbox, Qt.MouseButton.LeftButton, pos=checkbox.rect().center())
+    assert store.value.engine == 'rife' and store.value.rife_uhd
+    cugan = form.controls['cugan_model']
+    QTest.mouseClick(cugan, Qt.MouseButton.LeftButton, pos=cugan.rect().center())
+    assert store.value.engine == 'realcugan'
+    cugan.hidePopup()
+    form.close()
+
+
+def test_editing_dependent_controls_activates_required_setting(app):
+    store = SettingsStore(replace(Settings(), target='4k', watermark_corner='bottom-right', audio='copy', bit_rate=1000))
+    form = SettingsForm(store, ['width', 'watermark_x', 'audio_bitrate', 'quality'], Translator())
+    assert all(control.isEnabled() for control in form.controls.values())
+    form.controls['width'].setValue(1922)
+    assert store.value.target == 'custom'
+    form.controls['watermark_x'].setValue(0.3)
+    assert store.value.watermark_corner == 'free'
+    form.controls['audio_bitrate'].setValue(208000)
+    assert store.value.audio == 'aac'
+    form.controls['quality'].setValue(18)
+    assert store.value.bit_rate == 0
+    form.close()
+
+
 def test_custom_size_controls_do_not_allow_zero(app):
     store = SettingsStore(replace(Settings(), target='custom', aspect='fit'))
     form = SettingsForm(store, ['width', 'height'], Translator())
@@ -124,6 +161,79 @@ def test_queue_order_is_saved_and_running_queue_cannot_be_reordered(app, tmp_pat
     reopened = MainWindow()
     assert [job.source for job in reopened.runner.jobs] == [paths[1], paths[0], paths[2]]
     reopened.close()
+
+
+def test_queue_checkboxes_bulk_selection_removal_and_persistence(app, tmp_path):
+    from PySide6.QtCore import Qt
+    window = MainWindow()
+    paths = [tmp_path / f"{i}.mkv" for i in range(5)]
+    for path in paths:
+        path.touch()
+    window.add_paths([str(path) for path in paths])
+    jobs = window.runner.jobs[:]
+    for job, state in zip(jobs, ("queued", "done", "done_warning", "failed", "failed")):
+        job.state = state
+    window.table.selectRow(0)
+    window.check_jobs({"done", "done_warning"})
+    assert window._checked_job_ids == {jobs[1].id, jobs[2].id}
+    assert window.selected_job() is jobs[0]
+    index = window.queue_model.index(3, 0)
+    assert window.queue_model.setData(index, Qt.CheckState.Checked, Qt.ItemDataRole.CheckStateRole)
+    assert window.queue_model.data(index, Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
+    window.remove_checked()
+    assert window.runner.jobs == [jobs[0], jobs[4]]
+    assert not window._checked_job_ids
+    window.check_jobs({"failed"})
+    assert window._checked_job_ids == {jobs[4].id}
+    window.remove_checked()
+    window.close()
+    reopened = MainWindow()
+    assert [job.source for job in reopened.runner.jobs] == [paths[0]]
+    reopened.close()
+
+
+def test_clear_queue_keeps_current_job_and_checkbox_selection_tracks_jobs(app, tmp_path):
+    window = MainWindow()
+    paths = [tmp_path / f"{i}.mkv" for i in range(3)]
+    for path in paths:
+        path.touch()
+    window.add_paths([str(path) for path in paths])
+    current = window.runner.jobs[1]
+    window.check_jobs(None)
+    window.table.selectRow(1)
+    window.move_selected(-1)
+    assert window._checked_job_ids == {job.id for job in window.runner.jobs}
+    window.runner.current = current
+    window.clear_queue()
+    assert window.runner.jobs == [current]
+    assert window._checked_job_ids == {current.id}
+    window.check_jobs(set())
+    assert not window._checked_job_ids
+    window.runner.current = None
+    window.clear_queue()
+    assert not window.runner.jobs
+    window.close()
+
+
+def test_queue_checkbox_can_be_clicked(app, tmp_path):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QStyle, QStyleOptionViewItem
+    window = MainWindow()
+    source = tmp_path / "episode.mkv"
+    source.touch()
+    window.add_paths([str(source)])
+    window.show()
+    app.processEvents()
+    index = window.queue_model.index(0, 0)
+    option = QStyleOptionViewItem()
+    option.initFrom(window.table)
+    option.rect = window.table.visualRect(index)
+    option.features |= QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+    indicator = window.table.style().subElementRect(QStyle.SubElement.SE_ItemViewItemCheckIndicator, option, window.table)
+    QTest.mouseClick(window.table.viewport(), Qt.MouseButton.LeftButton, pos=indicator.center())
+    assert window._checked_job_ids == {window.runner.jobs[0].id}
+    window.close()
 
 
 def test_queue_preflight_reports_all_missing_sources_before_start(app, tmp_path, monkeypatch):

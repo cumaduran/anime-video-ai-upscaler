@@ -1,6 +1,9 @@
 #include "conversions.h"
 
 #include <cstddef>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 
 #include <spdlog/spdlog.h>
@@ -9,6 +12,48 @@
 
 namespace video2x {
 namespace conversions {
+
+ncnn::Mat gbrp16_to_ncnn_float(const AVFrame* frame) {
+    if (!frame || frame->format != AV_PIX_FMT_GBRP16LE) return ncnn::Mat();
+    ncnn::Mat result(frame->width, frame->height, 3, static_cast<size_t>(4));
+    if (result.empty()) return result;
+    const int planes[] = {2, 0, 1}; // FFmpeg GBR -> model RGB
+    for (int c = 0; c < 3; ++c) {
+        ncnn::Mat channel = result.channel(c);
+        for (int y = 0; y < frame->height; ++y) {
+            const auto* src = reinterpret_cast<const uint16_t*>(frame->data[planes[c]] + y * frame->linesize[planes[c]]);
+            float* dst = channel.row<float>(y);
+            for (int x = 0; x < frame->width; ++x) dst[x] = src[x] / 65535.f;
+        }
+    }
+    return result;
+}
+
+AVFrame* ncnn_float_to_gbrp16(const ncnn::Mat& mat) {
+    if (mat.dims != 3 || mat.c != 3 || mat.elemsize != 4u) return nullptr;
+    AVFrame* frame = av_frame_alloc();
+    if (!frame) return nullptr;
+    frame->format = AV_PIX_FMT_GBRP16LE;
+    frame->width = mat.w;
+    frame->height = mat.h;
+    if (av_frame_get_buffer(frame, 32) < 0) {
+        av_frame_free(&frame);
+        return nullptr;
+    }
+    const int planes[] = {2, 0, 1};
+    for (int c = 0; c < 3; ++c) {
+        const ncnn::Mat channel = mat.channel(c);
+        for (int y = 0; y < mat.h; ++y) {
+            const float* src = channel.row<float>(y);
+            auto* dst = reinterpret_cast<uint16_t*>(frame->data[planes[c]] + y * frame->linesize[planes[c]]);
+            for (int x = 0; x < mat.w; ++x) {
+                const float value = std::isfinite(src[x]) ? std::clamp(src[x], 0.0f, 1.0f) : 0.0f;
+                dst[x] = static_cast<uint16_t>(std::lround(value * 65535.f));
+            }
+        }
+    }
+    return frame;
+}
 
 // Convert AVFrame format
 [[gnu::target_clones("arch=x86-64-v4", "arch=x86-64-v3", "default")]]

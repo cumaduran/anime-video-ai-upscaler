@@ -68,6 +68,7 @@ RealCUGAN::RealCUGAN(int gpuid, bool _tta_mode, int num_threads)
     bicubic_3x = 0;
     bicubic_4x = 0;
     tta_mode = _tta_mode;
+    pro_mode = false;
 }
 
 RealCUGAN::~RealCUGAN()
@@ -236,6 +237,120 @@ int RealCUGAN::load(const std::string& parampath, const std::string& modelpath)
         bicubic_4x->create_pipeline(net.opt);
     }
 
+    return 0;
+}
+
+int RealCUGAN::process_float(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
+{
+    if (tta_mode || scale < 2 || scale > 4 || syncgap < 0 || syncgap > 3 || tilesize < 1 || inimage.dims != 3 ||
+        inimage.c != 3 || inimage.elemsize != 4u || outimage.dims != 3 || outimage.c != 3 ||
+        outimage.elemsize != 4u || outimage.w != inimage.w * scale || outimage.h != inimage.h * scale)
+        return -1;
+    auto reflect = [](int p, int length) {
+        if (length <= 1) return 0;
+        const int period = 2 * (length - 1);
+        p = ((p % period) + period) % period;
+        return p < length ? p : period - p;
+    };
+    auto make_tile = [&](int x, int y, int size) {
+        const int w = std::min(size, inimage.w - x), h = std::min(size, inimage.h - y);
+        const int align = scale == 3 ? 4 : 2;
+        ncnn::Mat tile(w + 2 * prepadding + (align - w % align) % align,
+                       h + 2 * prepadding + (align - h % align) % align, 3, (size_t)4u);
+        if (tile.empty()) return tile;
+        for (int c = 0; c < 3; ++c) {
+            const ncnn::Mat src = inimage.channel(c);
+            ncnn::Mat dst = tile.channel(c);
+            for (int ty = 0; ty < tile.h; ++ty) {
+                const float* row = src.row<float>(reflect(y + ty - prepadding, inimage.h));
+                float* target = dst.row<float>(ty);
+                const int first = std::max(0, prepadding - x);
+                const int last = std::min(tile.w, prepadding + inimage.w - x);
+                for (int tx = 0; tx < first; ++tx) target[tx] = row[reflect(x + tx - prepadding, inimage.w)];
+                if (last > first) {
+                    if (pro_mode) {
+                        for (int tx = first; tx < last; ++tx)
+                            target[tx] = row[x + tx - prepadding] * 0.7f + 0.15f;
+                    } else {
+                        memcpy(target + first, row + x + first - prepadding, (size_t)(last - first) * sizeof(float));
+                    }
+                }
+                for (int tx = last; tx < tile.w; ++tx) target[tx] = row[reflect(x + tx - prepadding, inimage.w)];
+                if (pro_mode) {
+                    for (int tx = 0; tx < first; ++tx) target[tx] = target[tx] * 0.7f + 0.15f;
+                    for (int tx = last; tx < tile.w; ++tx) target[tx] = target[tx] * 0.7f + 0.15f;
+                }
+            }
+        }
+        return tile;
+    };
+    const char* names[] = {"gap0", "gap1", "gap2", "gap3"};
+    ncnn::Mat averages[4];
+    const bool synchronize = syncgap && (inimage.w > tilesize || inimage.h > tilesize);
+    if (synchronize) {
+        // Accurate mode recomputes each successive pooling feature with the
+        // preceding averages installed. Rough mode averages all four at once.
+        const int passes = syncgap == 1 ? 4 : 1;
+        for (int pass = 0; pass < passes; ++pass) {
+            const int first = syncgap == 1 ? pass : 0, last = syncgap == 1 ? pass + 1 : 4;
+            ncnn::Mat sums[4]; int tiles = 0;
+            const bool sample = syncgap == 3 && inimage.w > 64 && inimage.h > 64;
+            const int step = sample ? 96 : tilesize, sample_size = sample ? 32 : tilesize;
+            const int end_x = sample ? inimage.w - 64 : inimage.w;
+            const int end_y = sample ? inimage.h - 64 : inimage.h;
+            for (int y = 0; y < end_y; y += step) for (int x = 0; x < end_x; x += step) {
+                ncnn::Mat tile = make_tile(x, y, sample_size);
+                if (tile.empty()) return -1;
+                ncnn::Extractor ex = net.create_extractor();
+                if (ex.input("in0", tile)) return -1;
+                for (int i = 0; i < first; ++i) if (ex.input(names[i], averages[i])) return -1;
+                for (int i = first; i < last; ++i) {
+                    ncnn::Mat feat;
+                    if (ex.extract(names[i], feat) || feat.empty() || feat.elemsize != 4u || feat.elempack != 1) return -1;
+                    if (sums[i].empty()) { sums[i].create_like(feat); if (sums[i].empty()) return -1; sums[i].fill(0.f); }
+                    if (sums[i].total() != feat.total()) return -1;
+                    const float* source = feat; float* target = sums[i];
+                    for (size_t j = 0; j < feat.total(); ++j) target[j] += source[j];
+                }
+                ++tiles;
+            }
+            if (!tiles) return -1;
+            for (int i = first; i < last; ++i) {
+                float* values = sums[i];
+                for (size_t j = 0; j < sums[i].total(); ++j) values[j] /= tiles;
+                averages[i] = sums[i];
+            }
+        }
+    }
+    for (int y = 0; y < inimage.h; y += tilesize)
+        for (int x = 0; x < inimage.w; x += tilesize)
+        {
+            const int w = std::min(tilesize, inimage.w - x), h = std::min(tilesize, inimage.h - y);
+            ncnn::Mat tile = make_tile(x, y, tilesize);
+            if (tile.empty()) return -1;
+            ncnn::Extractor ex = net.create_extractor();
+            if (ex.input("in0", tile)) return -1;
+            if (synchronize) for (int i = 0; i < 4; ++i) if (ex.input(names[i], averages[i])) return -1;
+            ncnn::Mat result;
+            if (ex.extract("out0", result) || result.empty() || result.c != 3 || result.elemsize != 4u ||
+                result.w < w * scale || result.h < h * scale) return -1;
+            for (int c = 0; c < 3; ++c) {
+                const ncnn::Mat src = result.channel(c), original = inimage.channel(c);
+                ncnn::Mat dst = outimage.channel(c);
+                for (int ty = 0; ty < h * scale; ++ty) {
+                    float* target = dst.row<float>(y * scale + ty) + x * scale;
+                    const float* row = src.row<float>(ty);
+                    if (pro_mode) {
+                        for (int tx = 0; tx < w * scale; ++tx) target[tx] = (row[tx] - 0.15f) / 0.7f;
+                    } else if (scale != 4) {
+                        memcpy(target, row, (size_t)w * scale * sizeof(float));
+                    } else {
+                        const float* reference = original.row<float>(y + ty / scale) + x;
+                        for (int tx = 0; tx < w * scale; ++tx) target[tx] = row[tx] + reference[tx / scale];
+                    }
+                }
+            }
+        }
     return 0;
 }
 

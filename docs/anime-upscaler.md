@@ -152,7 +152,9 @@ Anime4K and RIFE on constant-frame-rate inputs, with denoise off. RIFE segments
 overlap by one source frame to preserve interpolation at boundaries. It stores
 verified, lossless one-minute AI segments in a hidden
 checkpoint folder on the output drive. This can need many gigabytes, unlike the
-default streaming mode. Stop the queue or restart after an interruption, select
+default streaming mode. The queue readiness report displays the resume-mode
+safety threshold and warns that it is not a disk-space prediction; actual space
+requirements may be much higher. Stop the queue or restart after an interruption, select
 the video and choose **Retry selected**; completed segments are verified again
 and reused. The interrupted segment and final encode are restarted. Successful
 publication removes the generated checkpoint files. Changing the source,
@@ -205,12 +207,32 @@ if no new settings exist, the old `%APPDATA%\AnimeUpscaler7\settings.json` is re
 without removing it; prior external tool paths are not used. Tests can redirect the
 profile with `ANIME_UPSCALER_HOME`.
 
-The source-built engine streams uncompressed 8-bit RGB frames through bounded pipes
+The standard source-built engine path streams uncompressed 8-bit RGB frames through bounded pipes
 to the final encoder; it does not store a full-length AI intermediate. The final file
 and temporary comparison clips still need disk space. A 1 GiB reserve is monitored.
 Legacy engine builds fall back to lossless files and require more disk. Exporting
-10-bit does not restore precision lost in the 8-bit AI path.
-PQ/HLG HDR input is tone-mapped to BT.709 SDR, so HDR output is not preserved.
+10-bit does not restore precision lost in the standard 8-bit AI path.
+By default PQ/HLG HDR input is tone-mapped to BT.709 SDR.
+An opt-in experimental high-precision AI path is available under
+Advanced settings → AI. Select a compatible 10-bit 4:2:0 encoder format and a
+source explicitly tagged BT.709 or BT.2020 PQ/HLG with a known range. It supports
+Real-ESRGAN, Anime4K, Real-CUGAN with synchronized tiles, and RIFE including UHD. Legacy RIFE UHD estimates flow at half resolution; v4 uses its full-resolution path and does not save GPU memory.
+Real-CUGAN models may show tile seams without synchronization; models-nose selects 0 automatically.
+For Pro models and very narrow tiled frames, synchronization mode 3 uses mode 2 for stability. RGB data
+is carried at 16-bit precision into a floating-point model path; PQ/HLG transfer
+and primaries are retained in the 10-bit output. Models were trained for SDR,
+so HDR colors and highlights may change. With libx265, source HDR10 mastering and content-light metadata are copied and verified; they are not recalculated for modified pixels. Other encoders do not preserve these static fields. Dynamic HDR metadata is removed; this does not imply HDR10+ or Dolby Vision support.
+Resume uses large lossless 16-bit segments and requires denoise off. Denoise and
+flicker filters can change image quality. HDR watermarks and burned subtitles are
+converted from SDR using a nominal 100-nit reference white; HLG display brightness
+also depends on the display. Older RIFE models generate intermediate times by repeatedly
+interpolating midpoints; non-dyadic times are approximate and can be slower.
+Both Real-CUGAN Pro paths apply its [original input/output range conversion](https://github.com/bilibili/ailab/blob/2799af78ef105b414cc4b796c67c8511acdcdf6f/Real-CUGAN/upcunet_v3.py).
+Older reference engines may still produce black frames for 2× Pro.
+Compare a short sample and inspect the output on an appropriate display.
+When AI is disabled and a 10-bit 4:2:0 output format is selected, tone mapping
+keeps a 10-bit intermediate instead of first reducing it to 8-bit. This does not
+preserve HDR, and other filters or encoders may impose their own limits.
 BT.2020 sources without reliable transfer metadata are rejected. Right-angle
 rotation is normalized; ambiguous VFR and long-form A/V sync need further testing.
 

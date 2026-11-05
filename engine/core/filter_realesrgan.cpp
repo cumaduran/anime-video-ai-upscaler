@@ -104,6 +104,22 @@ int FilterRealesrgan::init(AVCodecContext* dec_ctx, AVCodecContext* enc_ctx, AVB
 int FilterRealesrgan::filter(AVFrame* in_frame, AVFrame** out_frame) {
     int ret;
 
+    // The explicit 16-bit planar RGB input/output path avoids the legacy
+    // packed 8-bit conversion. Only selected when both sides request it.
+    if (in_frame->format == AV_PIX_FMT_GBRP16LE && out_pix_fmt_ == AV_PIX_FMT_GBRP16LE) {
+        ncnn::Mat input = conversions::gbrp16_to_ncnn_float(in_frame);
+        if (input.empty()) return AVERROR(ENOMEM);
+        ncnn::Mat output(input.w * realesrgan_->scale, input.h * realesrgan_->scale, 3, (size_t)4u);
+        if (output.empty()) return AVERROR(ENOMEM);
+        ret = realesrgan_->process_float(input, output);
+        if (ret != 0) return ret;
+        *out_frame = conversions::ncnn_float_to_gbrp16(output);
+        if (!*out_frame) return AVERROR(ENOMEM);
+        av_frame_copy_props(*out_frame, in_frame);
+        (*out_frame)->pts = av_rescale_q(in_frame->pts, in_time_base_, out_time_base_);
+        return 0;
+    }
+
     // Convert the input frame to RGB24
     ncnn::Mat in_mat = conversions::avframe_to_ncnn_mat(in_frame);
     if (in_mat.empty()) {

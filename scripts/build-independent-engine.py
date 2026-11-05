@@ -16,7 +16,7 @@ vc = kit / 'msvc/VC/Tools/MSVC/14.44.35207'
 bin_dir = vc / 'bin/Hostx64/x64'
 sdk = kit / 'sdk/c'
 include = sdk / 'Include/10.0.26100.0'
-out = root / 'build' / 'native-independent'
+out = Path(os.environ.get('AVUE_BUILD_DIR', root / 'build' / 'native-independent')).resolve()
 out.mkdir(parents=True, exist_ok=True)
 ncnn = deps / 'ncnn/ncnn-20240820-windows-vs2022-shared/x64'
 ffmpeg = deps / 'ffmpeg-shared/ffmpeg-n7.1.5-12-g1fdbca85aa-win64-gpl-shared-7.1'
