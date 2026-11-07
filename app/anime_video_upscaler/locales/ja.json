@@ -346,7 +346,7 @@
     "Русский": "Русский"
   },
   "help": {
-    "high_precision": "実験機能。Real-ESRGAN, Anime4K、同期対応のReal-CUGAN、またはUHD対応のRIFE、10ビット4:2:0出力、色情報が明示されたBT.709またはBT.2020 PQ/HLGソースが必要です。再開には大きな16ビットファイルが必要です。HDRの透かしと焼き込み字幕は公称100ニットの白を使用し、HLGの明るさは画面にも依存します。モデルはSDR用に学習され、HDRの色が変化する場合があります。libx265はHDR10の静的マスタリング情報と輝度情報をコピーし、動的メタデータは削除します。短いサンプルで確認してください。",
+    "high_precision": "実験機能。Real-ESRGAN, Anime4K、同期対応のReal-CUGAN、またはUHD対応のRIFE、10ビット4:2:0出力、色情報が明示されたBT.709またはBT.2020 PQ/HLGソースが必要です。再開には大きな16ビットファイルが必要です。HDRの透かしと焼き込み字幕は公称100ニットの白を使用し、HLGの明るさは画面にも依存します。モデルはSDR用に学習され、HDRの色が変化する場合があります。libx265とhevc_nvencはHDR10の静的メタデータを保持します。対応するHEVCソースではHDR10+とDolby Visionプロファイル8.1も保持します。メタデータは再計算されません。短いサンプルで確認してください。",
     "audio_bitrate": "AAC ビットレート（bit/s）: 32,000–512,000 bits/s; AAC only. Higher output bitrate cannot recover lost audio details.",
     "restoration": "AI前のノイズ除去: optional mild temporal denoise; may soften fine detail. Compare a short sample.",
     "watermark_x": "透かしの水平位置: 0 = left, 1 = right. Drag the watermark in preview.",

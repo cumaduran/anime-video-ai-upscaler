@@ -105,8 +105,10 @@ def test_probe_different_known_frame_rates_indicate_vfr():
     media = Media.from_probe({"streams": [{"codec_type": "video", "index": 0, "width": 640,
                                            "height": 480, "avg_frame_rate": "24/1",
                                            "r_frame_rate": "30/1"}]})
-    with pytest.raises(ValueError, match="VFR"):
-        validate_media(Settings(), media)
+    assert media.variable_rate
+    validate_media(Settings(), media)
+    with pytest.raises(ValueError, match="RIFE"):
+        validate_media(replace(Settings(), engine='rife'), media)
 
 
 def test_bt2020_without_transfer_is_rejected():
@@ -249,10 +251,13 @@ def test_progress_never_reports_success_early():
     assert progress_value("out_time_us=N/A","encode",10,True) is None
 
 
-def test_recovery_is_off_by_default_and_vfr_is_rejected_for_ai():
+def test_recovery_is_off_by_default_and_vfr_restrictions_are_explicit():
     assert Settings().recover_shutdown is False
-    with pytest.raises(ValueError, match="VFR"):
-        validate_media(Settings(),replace(MEDIA,variable_rate=True))
+    validate_media(Settings(),replace(MEDIA,variable_rate=True))
+    with pytest.raises(ValueError, match="RIFE"):
+        validate_media(replace(Settings(), engine='rife'),replace(MEDIA,variable_rate=True))
+    with pytest.raises(ValueError, match="saved AI segments"):
+        validate_media(replace(Settings(), resume_segments=True),replace(MEDIA,variable_rate=True))
     validate_media(replace(Settings(),engine="none"),replace(MEDIA,variable_rate=True))
 
 

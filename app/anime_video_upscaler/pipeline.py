@@ -33,6 +33,9 @@ class Media:
     color_range: str = "unknown"
     hdr_master_display: str = ""
     hdr_content_light: str = ""
+    dynamic_hdr: bool = False
+    dovi_profile: int = 0
+    display_orientation: tuple[int, int, int, int] = ()
 
     def with_hdr_side_data(self, data: dict) -> Media:
         """Read static HDR10 metadata from the decoded first video frame."""
@@ -97,11 +100,18 @@ class Media:
         except (KeyError, TypeError, ValueError):
             pass
         rotation = int(float(video.get("tags", {}).get("rotate", 0)))
+        orientation = ()
         for side in video.get("side_data_list", []):
             rotation = int(float(side.get("rotation", rotation)))
+            if side.get('side_data_type') == 'Display Matrix':
+                rows = re.findall(r'^\s*[0-9a-fA-F]+:\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)',
+                                  side.get('displaymatrix', ''), re.M)
+                if len(rows) == 3:
+                    orientation = tuple(int(value) for row in rows[:2] for value in row[:2])
         width, height = int(video["width"]), int(video["height"])
         sar = ratio(video.get("sample_aspect_ratio", "1:1"), 1.0)
-        if rotation % 180 == 90:
+        swaps_axes = bool(orientation[1] and orientation[2]) if orientation else rotation % 180 == 90
+        if swaps_axes:
             width, height, sar = height, width, 1 / sar
         media = cls(width, height, duration,
                     avg_fps or nominal_fps,
@@ -118,6 +128,13 @@ class Media:
                     video.get("color_space") or "unknown", video.get("color_range") or "unknown")
         if media.width < 1 or media.height < 1:
             raise ValueError("Invalid input dimensions")
+        dovi = next((side for side in video.get('side_data_list', [])
+                     if side.get('side_data_type') == 'DOVI configuration record'), {})
+        media = replace(media, dovi_profile=int(dovi.get('dv_profile') or 0), display_orientation=orientation)
+        if media.dovi_profile == 5:
+            # Profile 5 is decoded through libplacebo into BT.2020/PQ before AI.
+            media = replace(media, hdr=True, uncertain_hdr=False, color_primaries='bt2020',
+                            color_transfer='smpte2084', color_space='bt2020nc', color_range='tv')
         return media
 
 
@@ -167,6 +184,13 @@ def lossless_working_bytes(s: Settings, media: Media) -> int | None:
 
 
 def validate_media(s: Settings, media: Media) -> None:
+    if media.dovi_profile == 7 and not (s.high_precision and s.engine != 'none' and s.codec in ('libx265', 'hevc_nvenc')):
+        raise ValueError('Dolby Vision profile 7 requires high-precision AI and HEVC output so its enhancement layer is not silently lost.')
+    if media.dovi_profile == 5:
+        if not (s.high_precision and s.engine != 'none' and s.codec in ('libx265', 'hevc_nvenc')):
+            raise ValueError('Dolby Vision profile 5 requires high-precision AI and HEVC output using libx265 or hevc_nvenc.')
+        if s.resume_segments:
+            raise ValueError('Dolby Vision profile 5 cannot use saved AI segments; turn off resume.')
     if media.uncertain_hdr:
         raise ValueError("BT.2020 input has no reliable transfer metadata; normalize a copy before processing")
     if media.rotation % 90:
@@ -177,8 +201,13 @@ def validate_media(s: Settings, media: Media) -> None:
         raise ValueError("Cannot determine frame rate for the AI stage")
     if s.engine != "none" and media.uncertain_frame_rate:
         raise ValueError("Frame-rate metadata is incomplete; normalize a copy to CFR before AI processing")
-    if s.engine != "none" and media.variable_rate:
-        raise ValueError("Input frame-rate metadata indicates VFR. Normalize a copy to CFR before AI processing")
+    if media.variable_rate and s.engine == 'rife':
+        if not (s.high_precision and media.hdr and s.codec in ('libx265', 'hevc_nvenc')):
+            raise ValueError('Variable-frame-rate RIFE requires high-precision HDR and libx265 or hevc_nvenc.')
+        if s.subtitle_mode == 'burn':
+            raise ValueError('Variable-frame-rate RIFE cannot burn subtitles; use selectable subtitles instead.')
+    if media.variable_rate and s.engine != 'none' and s.resume_segments:
+        raise ValueError('Variable-frame-rate input cannot use saved AI segments. Turn off Resume using saved AI segments.')
     if s.high_precision:
         supported = ((media.color_primaries == "bt709" and media.color_space == "bt709" and media.color_transfer == "bt709") or
                      (media.color_primaries == "bt2020" and media.color_space == "bt2020nc" and media.color_transfer in ("smpte2084", "arib-std-b67")))
@@ -198,6 +227,10 @@ def ai_command(s: Settings, tools: dict, source: Path, intermediate: Path, media
     s.validate()
     cmd = [tools["video2x"], "-i", str(source), "-o", str(intermediate), "-p", s.engine,
            "-d", str(s.gpu), "-c", "ffv1", "--pix-fmt", "gbrp16le" if s.high_precision else "bgr0"]
+    if media.variable_rate and s.engine != 'rife':
+        if '--no-recalculate-pts' not in help_text:
+            raise ValueError('Variable-frame-rate input requires an AI engine that preserves timestamps; update the bundled engine.')
+        cmd += ['--no-recalculate-pts']
     # FFV1 preserves the RGB output without an additional chroma subsampling pass.
     if "--no-copy-audio-streams" in help_text and "--no-copy-subtitle-streams" in help_text:
         cmd += ["--no-copy-audio-streams", "--no-copy-subtitle-streams"]
@@ -244,6 +277,43 @@ def high_precision_input_filters(media: Media) -> list[str]:
     return [f"zscale=matrixin={matrix}:matrix=gbr:rangein={value_range}:range=full", "format=gbrp16le"]
 
 
+def dovi5_converter(tools: dict, gpu: int) -> list[str]:
+    path = Path(tools['ffmpeg']).resolve().parent.parent / 'dovi-ffmpeg' / 'ffmpeg.exe'
+    if not path.is_file():
+        raise ValueError('Dolby Vision profile 5 requires the bundled Vulkan color converter; update the application runtime.')
+    return [str(path), '-init_hw_device', f'vulkan=vk:{gpu}', '-filter_hw_device', 'vk']
+
+
+def dovi5_pq_filters() -> list[str]:
+    return ['hwupload', 'libplacebo=format=yuv444p16le:colorspace=bt2020nc:color_primaries=bt2020:'
+            'color_trc=smpte2084:range=tv:apply_dolbyvision=1:peak_detect=0:tonemapping=clip:'
+            'contrast_recovery=0:dithering=none', 'hwdownload', 'format=yuv444p16le']
+
+
+def display_orientation_filters(media: Media) -> list[str]:
+    """Apply right-angle display transforms after Dolby color reconstruction."""
+    filters = []
+    if media.display_orientation:
+        a, b, c, d = media.display_orientation
+        if a and d:
+            if a < 0: filters.append('hflip')
+            if d < 0: filters.append('vflip')
+        elif b and c:
+            filters += ['transpose=clock', 'hflip']  # transpose without reflection
+            if c < 0: filters.append('hflip')
+            if b < 0: filters.append('vflip')
+        else:
+            raise ValueError('Dolby Vision non-orthogonal display transforms are not supported')
+    else:
+        rotation = media.rotation % 360
+        if rotation == 90: filters.append('transpose=2')
+        elif rotation == 180: filters += ['hflip', 'vflip']
+        elif rotation == 270: filters.append('transpose=1')
+    # The pixels are now in display orientation; do not carry the source
+    # matrix into an intermediate where a later decoder would rotate again.
+    return filters + ['sidedata=mode=delete:type=DISPLAYMATRIX']
+
+
 def high_precision_output_filters(media: Media) -> list[str]:
     matrix = "2020_ncl" if media.hdr else "709"
     primaries = "bt2020" if media.hdr else "bt709"
@@ -275,6 +345,8 @@ def video_filter_graph(s: Settings, media: Media, video_selector: str,
     tone_format = "yuv420p10le" if not preview and s.engine == "none" and s.pixel_format in ("yuv420p10le", "p010le") else "yuv420p"
     filters = (high_precision_output_filters(media) if s.high_precision and not preview else
                hdr_to_sdr_filters(media, tone_format) if preview or s.engine == "none" else [])
+    if preview and media.dovi_profile == 5:
+        filters = dovi5_pq_filters() + display_orientation_filters(media) + filters
     if preview and subtitle_name:
         # Input seeking resets timestamps; restore the timeline for subtitle timing.
         filters.append(f"setpts=PTS+{max(0.0, timestamp):.6f}/TB")
@@ -288,8 +360,13 @@ def video_filter_graph(s: Settings, media: Media, video_selector: str,
     if media.hdr:
         if not s.high_precision or preview:
             filters.append("setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709")
-        filters += [f"sidedata=mode=delete:type={kind}" for kind in
-                    ("MASTERING_DISPLAY_METADATA", "CONTENT_LIGHT_LEVEL", "DYNAMIC_HDR_PLUS", "DOVI_RPU_BUFFER", "DOVI_METADATA", "DYNAMIC_HDR_VIVID")]
+        # HEVC NVENC receives verified static metadata via input options.
+        # Keep those two fields through the graph; dynamic metadata still
+        # requires frame-accurate transfer and is handled separately.
+        kinds = ["DYNAMIC_HDR_PLUS", "DOVI_RPU_BUFFER", "DOVI_METADATA", "DYNAMIC_HDR_VIVID"]
+        if not (s.high_precision and s.codec == "hevc_nvenc" and not preview):
+            kinds += ["MASTERING_DISPLAY_METADATA", "CONTENT_LIGHT_LEVEL"]
+        filters += [f"sidedata=mode=delete:type={kind}" for kind in kinds]
     if s.aspect == "pad":
         tw, th = target_size(s, media)
         filters.append(f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:color=black")
@@ -342,7 +419,8 @@ def preview_command(s: Settings, tools: dict, source: Path, media: Media, timest
     if watermark_name and watermark_name != "watermark.png":
         raise ValueError("Invalid staged watermark name")
     timestamp = max(0.0, min(timestamp, max(0.0, media.duration - 1 / (media.fps or 25)))) if media.duration else max(0.0,timestamp)
-    cmd = [tools["ffmpeg"], "-hide_banner", "-loglevel", "error", "-nostdin", "-ss", f"{timestamp:.6f}",
+    executable = dovi5_converter(tools, s.gpu) if media.dovi_profile == 5 else [tools['ffmpeg']]
+    cmd = executable + (["-noautorotate"] if media.dovi_profile == 5 else []) + ["-hide_banner", "-loglevel", "error", "-nostdin", "-ss", f"{timestamp:.6f}",
            "-i", str(source)]
     wm_index = 1 if watermark_name else None
     if watermark_name:
@@ -376,8 +454,14 @@ def encoder_options(s: Settings, media: Media | None = None) -> list[str]:
                                ("refs", "refs", -1), ("qmin", "qmin", -1), ("qmax", "qmax", -1),
                                ("thread_count", "threads", 0)):
         value = getattr(s, key)
+        if key == 'max_b_frames' and media and media.dynamic_hdr:
+            continue
         if value > minimum:
             cmd += [f"-{flag}:v", str(value)]
+    if media and media.dynamic_hdr:
+        # The elementary-stream remux assigns presentation timestamps in
+        # order; disabling B frames avoids a decode/presentation order mismatch.
+        cmd += ['-bf:v', '0']
     options = extra_encoder_options(s.extra_options)
     if media and media.hdr and s.high_precision and s.codec == "libx265":
         static = []
@@ -411,8 +495,11 @@ def validate_output_streams(s: Settings, source: dict, output: dict, external_su
     if s.high_precision:
         src = next((st for st in source_streams if st.get("codec_type") == "video" and not st.get("disposition", {}).get("attached_pic")), {})
         dst = next((st for st in output_streams if st.get("codec_type") == "video"), {})
+        profile5 = any(side.get('side_data_type') == 'DOVI configuration record' and side.get('dv_profile') == 5
+                       for side in src.get('side_data_list', []))
+        colors = {'color_primaries': 'bt2020', 'color_transfer': 'smpte2084', 'color_space': 'bt2020nc'} if profile5 else src
         if (dst.get("pix_fmt") not in ("yuv420p10le", "p010le") or
-            any(dst.get(field) != src.get(field) for field in ("color_primaries", "color_transfer", "color_space"))):
+            any(dst.get(field) != colors.get(field) for field in ("color_primaries", "color_transfer", "color_space"))):
             raise ValueError("High-precision output color or bit depth verification failed; output was not published")
     for kind, expected in (
         ("audio", sum(st.get("codec_type") == "audio" for st in source_streams) if s.audio != "off" else 0),
@@ -432,6 +519,11 @@ def final_command(s: Settings, tools: dict, source: Path, video: Path, output: P
     cmd = [tools["ffmpeg"], "-hide_banner", "-nostdin", "-n"]
     if s.engine != "none" and media.video_start_offset:
         cmd += ["-itsoffset", f"{media.video_start_offset:.9f}"]
+    if s.high_precision and media.hdr and s.codec == "hevc_nvenc":
+        if media.hdr_master_display:
+            cmd += ["-mastering_display:v:0", media.hdr_master_display]
+        if media.hdr_content_light:
+            cmd += ["-content_light:v:0", media.hdr_content_light]
     cmd += ["-i", str(video), "-i", str(source)]
     next_input = 2
     watermark_index = None

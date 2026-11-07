@@ -346,7 +346,7 @@
     "Русский": "Русский"
   },
   "help": {
-    "high_precision": "Experimentell: Real-ESRGAN, Anime4K, Real-CUGAN mit Synchronisierung oder RIFE einschließlich UHD, 10-Bit-4:2:0-Ausgabe und markierte BT.709- oder BT.2020-PQ/HLG-Quelle. Fortsetzen speichert große verlustfreie 16-Bit-Segmente. HDR-Wasserzeichen und Untertitel verwenden eine nominelle Referenz von 100 Nit; HLG hängt auch vom Display ab. Modelle sind für SDR trainiert; HDR-Farben können sich ändern. libx265 kopiert statische HDR10-Mastering- und Helligkeitsmetadaten; dynamische Metadaten werden entfernt. Kurzen Ausschnitt prüfen.",
+    "high_precision": "Experimentell: Real-ESRGAN, Anime4K, Real-CUGAN mit Synchronisierung oder RIFE einschließlich UHD, 10-Bit-4:2:0-Ausgabe und markierte BT.709- oder BT.2020-PQ/HLG-Quelle. Fortsetzen speichert große verlustfreie 16-Bit-Segmente. HDR-Wasserzeichen und Untertitel verwenden eine nominelle Referenz von 100 Nit; HLG hängt auch vom Display ab. Modelle sind für SDR trainiert; HDR-Farben können sich ändern. libx265 und hevc_nvenc erhalten statische HDR10-Daten; kompatible HEVC-Quellen unterstützen HDR10+ und Dolby Vision Profil 8.1. Die Metadaten werden nicht neu berechnet. Kurzen Ausschnitt prüfen.",
     "audio_bitrate": "AAC-Bitrate (Bit/s): 32,000–512,000 bits/s; AAC only. Higher output bitrate cannot recover lost audio details.",
     "restoration": "Entrauschen vor KI: optional mild temporal denoise; may soften fine detail. Compare a short sample.",
     "watermark_x": "Wasserzeichen horizontal: 0 = left, 1 = right. Drag the watermark in preview.",

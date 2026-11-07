@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import codecs
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 import json
 import logging
@@ -24,6 +24,7 @@ from .config import Settings, config_dir
 from .streaming import StreamingJob
 from .subtitles import stage_subtitle
 from .disk_policy import RESERVE_BYTES, contains_disk_error, disk_error_text, preflight_threshold
+from .dynamic_hdr import DynamicHDRWorker
 from .estimates import add_observation
 from .pipeline import (ANSI, Media, ai_command, encoder_probe_command, final_command, hdr_to_sdr_filters, output_path,
                        high_precision_input_filters, lossless_working_bytes, progress_value, publish_output, validate_media, validate_output_streams)
@@ -62,6 +63,7 @@ class QueueRunner(QObject):
         self.current: Job | None = None
         self.process: QProcess | None = None
         self.stream_worker = None
+        self.dynamic_worker = None
         self.use_streaming = False
         self.busy = False
         self.cancelled = False
@@ -122,6 +124,9 @@ class QueueRunner(QObject):
         if self.stream_worker is not None:
             self.stream_worker.stop()
             return
+        if self.dynamic_worker is not None:
+            self.dynamic_worker.stop()
+            return
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
             # These tools spawn no children. On Windows kill terminates only this job's process.
             self.process.kill()
@@ -158,6 +163,8 @@ class QueueRunner(QObject):
             self.watermark_name = ""
             self._recovery_warning = ""
             self._hdr_metadata_verified = False
+            self._vfr_timestamps_verified = False
+            self.dynamic_metadata = None
             self._normalized_frames = 0
             self._ai_reported_frames = 0
             self._ai_success = False
@@ -223,7 +230,7 @@ class QueueRunner(QObject):
         process.finished.connect(self._exited)
         self._write(subprocess.list2cmdline(command))
         process.start(command[0], command[1:])
-        if stage in ("subtitle_check", "resume_count", "resume_verify_new", "resume_verify_existing", "verify_source_timing"):
+        if stage in ("subtitle_check", "resume_count", "resume_verify_new", "resume_verify_existing", "verify_source_timing", "dovi5_color_check"):
             self._timeout.start(300_000)
         elif stage in ("probe", "hdr_metadata_probe", "verify_hdr_metadata", "help", "filters", "encoders", "encoder_check", "verify"):
             self._timeout.start(30_000)
@@ -313,6 +320,9 @@ class QueueRunner(QObject):
         if self.stream_worker is not None:
             self.stream_worker.stop(self._timeout_error)
             return
+        if self.dynamic_worker is not None:
+            self.dynamic_worker.stop(self._timeout_error)
+            return
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
             self.process.kill()
         else:
@@ -366,6 +376,8 @@ class QueueRunner(QObject):
                     message = f"{self.current.settings.codec}: GPU encoder initialization failed. Check hardware, driver, codec and log."
             if self.stage == "subtitle_check":
                 message = "Subtitle validation failed. Check its encoding and timestamps. See the job log."
+            if self.stage == 'dovi5_color_check':
+                message = 'Dolby Vision profile 5 Vulkan color conversion could not start. Check the selected GPU, Vulkan driver and job log.'
             self._finish("failed", message)
             return
         try:
@@ -384,11 +396,15 @@ class QueueRunner(QObject):
             job.media_info = self.media
             if shutil.disk_usage(self.work).free < RESERVE_BYTES:
                 raise ValueError(disk_error_text(shutil.disk_usage(self.work).free, RESERVE_BYTES, job.output.parent))
-            if self.media.hdr and s.high_precision:
-                self._launch("hdr_metadata_probe", [self.tools["ffprobe"], "-v", "error", "-read_intervals", "%+#40",
-                    "-select_streams", str(self.media.video_index), "-show_frames", "-show_entries", "frame=side_data_list",
-                    "-of", "json", str(job.source)], self.work)
+            if s.engine == 'rife':
+                self._launch_vfr_timestamps('rife_cfr_probe', job.source, str(self.media.video_index), 'rife-source.csv')
                 return
+            self._after_initial_probe()
+        elif self.stage == 'rife_cfr_probe':
+            self._verify_rife_source_cfr()
+            self._after_initial_probe()
+        elif self.stage == 'dovi5_color_check':
+            self._write('Dolby Vision profile 5 Vulkan color conversion verified.')
             self._prepare_subtitle_checks()
         elif self.stage == "hdr_metadata_probe":
             metadata_probe = json.loads(self._capture)
@@ -396,24 +412,29 @@ class QueueRunner(QObject):
             job.media_info = self.media
             side_data = [item for frame in metadata_probe.get("frames", []) for item in frame.get("side_data_list", [])]
             side_data += [item for stream in self.probe_data.get("streams", []) for item in stream.get("side_data_list", [])]
-            if any(any(name in str(item.get("side_data_type", "")).lower() for name in ("dynamic hdr", "smpte2094", "dovi", "dolby vision")) for item in side_data):
-                warning = "Dynamic HDR or Dolby Vision metadata cannot be preserved after AI processing; use a compatible HDR10 source or review the output."
-                self._recovery_warning = " ".join(filter(None, (self._recovery_warning, warning)))
-                self._write(warning)
+            dynamic_detected = any(any(name in str(item.get("side_data_type", "")).lower() for name in ("dynamic hdr", "smpte2094", "dovi", "dolby vision")) for item in side_data)
             if self.media.hdr_master_display or self.media.hdr_content_light:
-                if s.codec == "libx265":
+                if s.codec in ("libx265", "hevc_nvenc"):
                     self._write("Source HDR mastering and content-light metadata will be copied to the HEVC output; image processing can change actual brightness.")
                 else:
-                    warning = "Source HDR mastering or content-light metadata cannot be copied with the selected encoder; select libx265 to preserve it."
+                    warning = "Source HDR mastering or content-light metadata cannot be copied with the selected encoder; select libx265 or hevc_nvenc to preserve it."
                     self._recovery_warning = " ".join(filter(None, (self._recovery_warning, warning)))
                     self._write(warning)
-            self._prepare_subtitle_checks()
+            video = next(stream for stream in self.probe_data.get('streams', []) if stream.get('index') == self.media.video_index)
+            if video.get('codec_name') == 'hevc':
+                self._start_dynamic_worker('prepare')
+            elif dynamic_detected:
+                raise ValueError('Dynamic HDR metadata is currently supported only for HEVC sources and outputs.')
+            else:
+                self._prepare_subtitle_checks()
         elif self.stage == "subtitle_check":
             self._write("Subtitle decoded successfully before processing.")
             self._check_next_subtitle()
         elif self.stage == "help":
             self.help_text = self._capture
             self.use_streaming = "stream-nut-v1" in self.help_text and not s.resume_segments
+            if self.media.variable_rate and not self.use_streaming:
+                raise ValueError('Variable-frame-rate input requires the bundled streaming AI engine.')
             precision_capability = {"realcugan": "rgb16-realcugan-tiled-v1", "rife": "rgb16-rife-v4-v1", "libplacebo": "rgb16-libplacebo-v1"}.get(s.engine, "rgb16-realesrgan-v1")
             if s.engine == "realcugan" and s.cugan_model != "models-nose" and s.cugan_syncgap:
                 precision_capability = "rgb16-realcugan-sync-v1"
@@ -533,10 +554,14 @@ class QueueRunner(QObject):
             self.normalized.unlink(missing_ok=True)
             self._encode()
         elif self.stage == "encode":
-            self._launch("verify", [self.tools["ffprobe"], "-v", "error", "-show_streams", "-show_format", "-of", "json", str(self.partial)], self.work)
+            self._after_encode()
         elif self.stage == "verify":
             output_probe = json.loads(self._capture)
+            self._vfr_output_probe = output_probe
             result = Media.from_probe(output_probe)
+            if self.use_streaming and s.engine != 'rife' and result.variable_rate and not self.media.variable_rate:
+                self.media = replace(self.media, variable_rate=True)
+                job.media_info = self.media
             if self.media.hdr and not s.high_precision:
                 output_video = next(stream for stream in output_probe["streams"] if stream.get("codec_type") == "video" and not stream.get("disposition", {}).get("attached_pic"))
                 if output_video.get("color_transfer") != "bt709" or output_video.get("color_primaries") != "bt709":
@@ -574,10 +599,20 @@ class QueueRunner(QObject):
             self._hdr_metadata_verified = True
             self._write("Source HDR static metadata verified in the output.")
             self._publish_verified()
+        elif self.stage == 'verify_vfr_source':
+            self._launch_vfr_timestamps('verify_vfr_output', self.partial, 'v:0', 'vfr-output.csv')
+        elif self.stage == 'verify_vfr_output':
+            self._verify_vfr_timestamps()
+            self._vfr_timestamps_verified = True
+            self._write('Presentation timestamps verified for every output frame.')
+            self._publish_verified()
 
     def _publish_verified(self):
         job = self.current
-        if (job.settings.high_precision and job.settings.codec == "libx265" and self.media.hdr and
+        if self.use_streaming and job.settings.engine != 'rife' and not self._vfr_timestamps_verified:
+            self._launch_vfr_timestamps('verify_vfr_source', job.source, str(self.media.video_index), 'vfr-source.csv')
+            return
+        if (job.settings.high_precision and job.settings.codec in ("libx265", "hevc_nvenc") and self.media.hdr and
                 (self.media.hdr_master_display or self.media.hdr_content_light) and not self._hdr_metadata_verified):
             self._launch("verify_hdr_metadata", [self.tools["ffprobe"], "-v", "error", "-read_intervals", "%+#40",
                 "-select_streams", "v:0", "-show_frames", "-show_entries", "frame=side_data_list", "-of", "json", str(self.partial)], self.work)
@@ -588,6 +623,117 @@ class QueueRunner(QObject):
         self._cleanup_resume()
         job.percent = 100
         self._finish("done_warning" if self._recovery_warning else "done", self._recovery_warning)
+
+    def _after_initial_probe(self):
+        job = self.current
+        if self.media.variable_rate and job.settings.engine == 'rife':
+            video = next(stream for stream in self.probe_data['streams'] if stream.get('index') == self.media.video_index)
+            if video.get('codec_name') != 'hevc':
+                raise ValueError('Variable-frame-rate RIFE currently requires an HEVC source.')
+        if self.media.hdr and job.settings.high_precision:
+            self._launch('hdr_metadata_probe', [self.tools['ffprobe'], '-v', 'error', '-read_intervals', '%+#40',
+                         '-select_streams', str(self.media.video_index), '-show_frames', '-show_entries', 'frame=side_data_list',
+                         '-of', 'json', str(job.source)], self.work)
+        else:
+            self._prepare_subtitle_checks()
+
+    def _verify_rife_source_cfr(self):
+        first = None
+        count = 0
+        with (self.work / 'rife-source.csv').open(encoding='utf-8') as lines:
+            for line in lines:
+                field = line.strip().split(',', 1)[0]
+                if not field:
+                    continue
+                try:
+                    value = float(field)
+                except ValueError as error:
+                    raise ValueError('Cannot verify source frame timestamps for RIFE') from error
+                if not math.isfinite(value):
+                    raise ValueError('Cannot verify source frame timestamps for RIFE')
+                if first is None:
+                    first = value
+                if abs(value - first - count / self.media.fps) > .002:
+                    self.media = replace(self.media, variable_rate=True)
+                    self.current.media_info = self.media
+                    validate_media(self.current.settings, self.media)
+                count += 1
+        if not count:
+            raise ValueError('Cannot verify source frame timestamps for RIFE')
+
+    def _launch_vfr_timestamps(self, stage, path, selector, filename):
+        self._launch(stage, [self.tools['ffprobe'], '-v', 'error', '-select_streams', selector,
+                            '-show_entries', 'frame=best_effort_timestamp_time,duration_time', '-of', 'csv=p=0',
+                            '-o', str(self.work / filename), str(path)], self.work)
+
+    def _verify_vfr_timestamps(self):
+        from itertools import zip_longest
+
+        def timestamps(path):
+            with path.open(encoding='utf-8') as lines:
+                for line in lines:
+                    columns = line.strip().split(',')
+                    field = columns[0]
+                    if not field:
+                        continue
+                    try:
+                        value = float(field)
+                    except ValueError as error:
+                        raise ValueError('Cannot verify variable-frame-rate timestamps; output was not published') from error
+                    if not math.isfinite(value):
+                        raise ValueError('Cannot verify variable-frame-rate timestamps; output was not published')
+                    duration = None
+                    if len(columns) > 1 and columns[1] not in ('', 'N/A'):
+                        try:
+                            candidate = float(columns[1])
+                            if math.isfinite(candidate) and candidate > 0:
+                                duration = candidate
+                        except ValueError:
+                            pass
+                    yield value, duration
+
+        source = timestamps(self.work / 'vfr-source.csv')
+        output = timestamps(self.work / 'vfr-output.csv')
+        first_source = first_output = None
+        previous_source = previous_output = None
+        count = 0
+        last_source_duration = last_output_duration = None
+        for src_frame, dst_frame in zip_longest(source, output):
+            if src_frame is None or dst_frame is None:
+                raise ValueError('Variable-frame-rate frame count changed; output was not published')
+            src, last_source_duration = src_frame
+            dst, last_output_duration = dst_frame
+            if first_source is None:
+                first_source, first_output = src, dst
+            if (previous_source is not None and (src <= previous_source or dst <= previous_output)) or abs((src - first_source) - (dst - first_output)) > .002:
+                raise ValueError('Variable-frame-rate timestamps changed; output was not published')
+            previous_source, previous_output = src, dst
+            count += 1
+        if not count:
+            raise ValueError('Cannot verify variable-frame-rate timestamps; output was not published')
+        if (last_source_duration is not None and last_output_duration is not None and
+                abs(last_source_duration - last_output_duration) > .002):
+            raise ValueError('Variable-frame-rate final frame duration changed; output was not published')
+        # Stream copies must retain their offsets relative to the video, not
+        # merely their own first timestamp after the muxer normalizes time.
+        original = self.probe_data['streams']
+        final = self._vfr_output_probe['streams']
+        video_in = next(stream for stream in original if stream.get('index') == self.media.video_index)
+        video_out = next(stream for stream in final if stream.get('codec_type') == 'video')
+        dynamic_audio_checked = bool(getattr(self, 'dynamic_metadata', None) and self.dynamic_metadata.timecodes)
+        for kind, enabled in (('audio', self.current.settings.audio == 'copy' and not dynamic_audio_checked),
+                              ('subtitle', self.current.settings.copy_subtitles)):
+            if not enabled:
+                continue
+            before = [stream for stream in original if stream.get('codec_type') == kind]
+            after = [stream for stream in final if stream.get('codec_type') == kind]
+            for src, dst in zip(before, after):
+                fields = (video_in.get('start_time'), video_out.get('start_time'), src.get('start_time'), dst.get('start_time'))
+                if any(value in (None, 'N/A') for value in fields):
+                    continue
+                vi, vo, si, so = map(float, fields)
+                if not all(map(math.isfinite, (vi, vo, si, so))) or abs((si - vi) - (so - vo)) > .003:
+                    raise ValueError('Variable-frame-rate audio or subtitle timing changed; output was not published')
 
     def _check_working_space(self):
         free = shutil.disk_usage(self.work).free
@@ -734,7 +880,76 @@ class QueueRunner(QObject):
             self._finish("failed", error)
         else:
             self._normalized_frames = frames
-            self._launch("verify", [self.tools["ffprobe"], "-v", "error", "-show_streams", "-show_format", "-of", "json", str(self.partial)], self.work)
+            self._after_encode()
+
+    def _start_dynamic_worker(self, phase):
+        self.stage = self.current.state = 'hdr_dynamic_' + phase
+        self.changed.emit(self.current)
+        worker = DynamicHDRWorker(phase, self.tools, self.current.source, self.work, self.media,
+                                  self.current.settings, self.dynamic_metadata, self.partial, self)
+        self.dynamic_worker = worker
+        worker.log.connect(self._write)
+        worker.finished.connect(self._dynamic_exited)
+        worker.start()
+
+    def _dynamic_exited(self):
+        worker = self.dynamic_worker
+        self.dynamic_worker = None
+        phase, error, result = worker.phase, worker.error, worker.result
+        worker.deleteLater()
+        if self.cancelled:
+            self._finish('cancelled')
+        elif error:
+            self._finish('failed', error)
+        elif phase == 'prepare':
+            self.dynamic_metadata = result
+            if result.present:
+                self.media = replace(self.media, dynamic_hdr=True, variable_rate=self.media.variable_rate or bool(result.timecodes))
+                self.current.media_info = self.media
+                warning = (('HDR10+ or Dolby Vision metadata is copied from the source, not recalculated for AI changes; '
+                            'interpolated frames use the preceding source metadata. B frames are disabled for alignment.')
+                           if result.hdr10plus or result.dovi else
+                           'Variable-frame-rate RIFE retains source timing; B frames are disabled for alignment.')
+                self._recovery_warning = ' '.join(filter(None, (self._recovery_warning, warning)))
+                self._write(warning)
+                if result.fel_bl:
+                    warning = ('Dolby Vision profile 7 FEL was combined with its base layer and converted to profile 8.1; '
+                               'the 10-bit output and source metadata may differ from the original 12-bit picture.')
+                    self._recovery_warning = ' '.join(filter(None, (self._recovery_warning, warning)))
+                    self._write(warning)
+                elif result.converted_profile7:
+                    warning = 'Dolby Vision profile 7 MEL was converted to profile 8.1; the minimal enhancement layer is not included.'
+                    self._recovery_warning = ' '.join(filter(None, (self._recovery_warning, warning)))
+                    self._write(warning)
+                if result.converted_profile5:
+                    warning = ('Dolby Vision profile 5 was converted to profile 8.1 using Vulkan color reshaping; '
+                               'metadata describes the source and is not recalculated for AI changes.')
+                    self._recovery_warning = ' '.join(filter(None, (self._recovery_warning, warning)))
+                    self._write(warning)
+            if result.converted_profile5:
+                try:
+                    from .pipeline import display_orientation_filters, dovi5_converter, dovi5_pq_filters
+                    command = dovi5_converter(self.tools, self.current.settings.gpu) + [
+                        '-v', 'error', '-nostdin', '-noautorotate', '-i', str(self.current.source),
+                        '-map', f'0:{self.media.video_index}', '-vf', ','.join(dovi5_pq_filters() + display_orientation_filters(self.media) + high_precision_input_filters(self.media)),
+                        '-frames:v', '1', '-f', 'null', '-']
+                    self._launch('dovi5_color_check', command, self.work)
+                except (ValueError, OSError) as error:
+                    self._finish('failed', str(error))
+            else:
+                self._prepare_subtitle_checks()
+        else:
+            try:
+                os.replace(result, self.partial)
+                self._launch('verify', [self.tools['ffprobe'], '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(self.partial)], self.work)
+            except OSError as error:
+                self._finish('failed', str(error))
+
+    def _after_encode(self):
+        if getattr(self, 'dynamic_metadata', None) and self.dynamic_metadata.present:
+            self._start_dynamic_worker('finish')
+        else:
+            self._launch('verify', [self.tools['ffprobe'], '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(self.partial)], self.work)
 
     def _begin_processing(self):
         job = self.current
@@ -747,7 +962,8 @@ class QueueRunner(QObject):
             self.stage = self.current.state = "stream"
             self.changed.emit(self.current)
             worker = StreamingJob(s, self.tools, job.source, self.partial, self.work, self.media,
-                                  self.help_text, self.subtitle_name, self.watermark_name, self)
+                                  self.help_text, self.subtitle_name, self.watermark_name, self,
+                                  dynamic_metadata=self.dynamic_metadata)
             self.stream_worker = worker
             worker.log.connect(self._write)
             worker.progress.connect(self._stream_progress)

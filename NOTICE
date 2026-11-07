@@ -19,6 +19,20 @@ The source code can be found at https://github.com/nihui/rife-ncnn-vulkan.
 This product depends on ncnn, which is available under the BSD 3-Clause License.
 The source code can be found at https://github.com/Tencent/ncnn.
 
+This product includes hdr10plus_tool and dovi_tool, both available under the MIT License.
+Their source code is available at https://github.com/quietvoid/hdr10plus_tool and
+https://github.com/quietvoid/dovi_tool. License copies are included with the runtime.
+
+This product includes mkvmerge from MKVToolNix, copyright Moritz Bunkus and contributors,
+under the GNU General Public License version 2. Source: https://mkvtoolnix.download/sources/.
+The license is included in runtime/licenses/mkvtoolnix-GPL-2.0.txt.
+
+Dolby Vision FEL processing uses FelBaker and FFMS2 (GPLv3), VapourSynth
+(LGPLv2.1 or later), and Python (Python Software Foundation license).
+Sources: https://github.com/bbeny123/felbaker, https://github.com/FFMS/ffms2,
+https://github.com/vapoursynth/vapoursynth, and https://www.python.org/.
+License copies are included in the runtime.
+
 Anime Video Upscaler & Encoder desktop workflow, documentation, and original moon-fox SVG icon
 Copyright (C) 2026 @cumaduran. Licensed under the repository AGPL-3.0 license.
 The Qt UI uses PySide6/Qt (LGPLv3/GPLv3/commercial); dependency notices must be

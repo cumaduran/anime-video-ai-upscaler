@@ -24,7 +24,8 @@ def test_queue_roundtrip_does_not_resume_interrupted_or_completed_work(tmp_path)
     assert restored[1].state == 'done' and restored[1].output == done.output
 
 
-@pytest.mark.parametrize('state', ['verify_source_timing', 'hdr_metadata_probe', 'verify_hdr_metadata'])
+@pytest.mark.parametrize('state', ['verify_source_timing', 'hdr_metadata_probe', 'verify_hdr_metadata',
+                                   'rife_cfr_probe', 'verify_vfr_source', 'verify_vfr_output'])
 def test_queue_restores_verification_as_interrupted(tmp_path, state):
     path = tmp_path / 'queue.json'
     save_queue(path, [Job(tmp_path / 'source.mkv', Settings(), state=state),

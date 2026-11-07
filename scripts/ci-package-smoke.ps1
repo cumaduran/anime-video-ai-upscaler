@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Path
 $appDir = if ($AppDirectory) { [IO.Path]::GetFullPath($AppDirectory) } else { Join-Path $repoRoot 'build\anime-video-upscaler-dev\dist\Anime Video Upscaler and Encoder' }
 $exe = Join-Path $appDir 'Anime Video Upscaler and Encoder.exe'
-foreach ($path in @($exe, (Join-Path $appDir 'runtime\engine\avue-engine.exe'), (Join-Path $appDir 'runtime\engine\avue-realcugan.exe'), (Join-Path $appDir 'runtime\engine\vcomp140.dll'), (Join-Path $appDir 'runtime\engine\RealCUGAN-LICENSE.txt'), (Join-Path $appDir 'runtime\ffmpeg\ffmpeg.exe'), (Join-Path $appDir 'runtime\ffmpeg\ffprobe.exe'), (Join-Path $appDir 'LICENSE'), (Join-Path $appDir 'NOTICE'))) {
+foreach ($path in @($exe, (Join-Path $appDir 'runtime\engine\avue-engine.exe'), (Join-Path $appDir 'runtime\engine\avue-realcugan.exe'), (Join-Path $appDir 'runtime\engine\vcomp140.dll'), (Join-Path $appDir 'runtime\engine\RealCUGAN-LICENSE.txt'), (Join-Path $appDir 'runtime\ffmpeg\ffmpeg.exe'), (Join-Path $appDir 'runtime\ffmpeg\ffprobe.exe'), (Join-Path $appDir 'runtime\hdr-metadata\dovi_tool.exe'), (Join-Path $appDir 'runtime\hdr-metadata\hdr10plus_tool.exe'), (Join-Path $appDir 'runtime\licenses\dovi-tool.txt'), (Join-Path $appDir 'runtime\licenses\hdr10plus-tool.txt'), (Join-Path $appDir 'LICENSE'), (Join-Path $appDir 'NOTICE'))) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Package file missing: $path" }
 }
 $manifest = Get-Content -LiteralPath (Join-Path $appDir 'runtime\SHA256.json') -Raw | ConvertFrom-Json
@@ -17,6 +17,14 @@ if ($LASTEXITCODE -ne 0) { throw 'Bundled AI engine failed to start.' }
 if ($LASTEXITCODE -ne 0) { throw 'Bundled FFmpeg failed to start.' }
 & (Join-Path $appDir 'runtime\ffmpeg\ffprobe.exe') -version | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Bundled FFprobe failed to start.' }
+& (Join-Path $appDir 'runtime\dovi-ffmpeg\ffmpeg.exe') -version | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Bundled Dolby Vision color converter failed to start.' }
+& (Join-Path $appDir 'runtime\fel-baker\python\python.exe') -c 'import vapoursynth; print(vapoursynth.core.version_number())' | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Bundled Dolby Vision FEL runtime failed to start.' }
+foreach ($name in @('dovi_tool.exe', 'hdr10plus_tool.exe', 'mkvmerge.exe')) {
+    & (Join-Path $appDir "runtime\hdr-metadata\$name") --version | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Bundled HDR metadata tool failed to start: $name" }
+}
 $oldPath = $env:PATH
 $oldProfile = $env:ANIME_UPSCALER_HOME
 $oldQt = $env:QT_QPA_PLATFORM

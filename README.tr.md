@@ -267,10 +267,13 @@ değiştirebilir. HDR filigran ve görüntüye işlenmiş altyazı SDR beyazın�
 
 Bu yol AI giriş ve çıkışında 8 bite düşmez ve HDR kaynakta PQ/HLG renk etiketlerini
 korur. Modeller SDR için eğitildiğinden HDR'de renk ve parlaklık değişebilir;
-libx265 seçildiğinde kaynak HDR10 mastering ve içerik parlaklığı üst verileri kopyalanıp doğrulanır; bunlar değişen görüntünün parlaklığını yeniden hesaplamaz. Diğer kodlayıcılarda sabit HDR üst verileri ve tüm kodlayıcılarda dinamik HDR/Dolby Vision bilgileri korunmaz. İşlem daha yavaş olabilir. Önce
+libx265 veya hevc_nvenc seçildiğinde kaynak HDR10 mastering ve içerik parlaklığı üst verileri kopyalanıp doğrulanır. HDR10+ ve Dolby Vision profil 8.1 üst verileri kare kare doğrulanır. Profil 5, Vulkan ile BT.2020/PQ renklerine dönüştürülerek profil 8.1 olarak kaydedilir. Profil 7 MEL, asgari ek katman çıkarılarak; profil 7 FEL ise temel ve ek görüntü katmanları birleştirilerek profil 8.1'e dönüştürülür. FEL işlemi AVX2 destekli işlemci, geçici disk alanı ve yüksek hassasiyetli AI gerektirir; kaydedilmiş parçalardan devam ve restorasyon kapatılmalıdır. Profil 7 için örnek karşılaştırması ek katmanı işlemediğinden kapalıdır; kısa bir kaynak dosyayı işleyerek karşılaştırın. Profil 5 ve FEL çıkışı 10 bittir ve özgün görüntüyle aynı kabul edilmemelidir. 90, 180 ve 270 derece döndürülmüş veya aynalanmış kaynaklarda Dolby Vision görüntü alanı düzeltilir. İki veya üç pencereli HDR10+ kaynaklarında pencere konumları çıktı boyutuna ve görüntü yönüne uyarlanır; her karenin üst verisi doğrulanır. Kaynakta her kare için doğrulanabilir zaman damgası ve HDR10+ verisi bulunmalıdır. Değişken kare hızı Real-ESRGAN, Real-CUGAN ve Anime4K ile, kaydedilmiş parçalardan devam modu kapalıyken desteklenir; kare zamanları ve kopyalanan ses/altyazı hizası doğrulanır. HDR10+/Dolby Vision ile değişken kare hızı da korunur. RIFE için yüksek hassasiyetli HDR HEVC kaynak ve libx265 veya hevc_nvenc gerekir; görüntüye işlenmiş altyazı yerine seçilebilir altyazı kullanın. Değişken kare hızlı FEL kaynaklarında da seçilebilir altyazı kullanın. RIFE ile eklenen kareler önceki kaynak karenin üst verisini kullanır; eşleştirme için B kareleri kapatılır. Üst veriler değişen görüntüye göre yeniden hesaplanmaz. Dinamik üst veri işlemi için geçici HEVC dosyalarına ek disk alanı gerekir. İşlem daha yavaş olabilir. Önce
 kısa örneği ve sonucu uygun bir HDR ekranda inceleyin. Eski RIFE modelleri yalnız
 orta kare ürettiği için diğer ara zamanlarda tekrarlı hesaplama kullanır; bu işlem
 daha yavaştır ve tam orta kareye denk gelmeyen zamanlar yaklaşık hesaplanır.
+
+Kare zamanı doğrulaması için kaynak ve çıktı kodlamadan sonra yeniden okunur;
+uzun veya yüksek çözünürlüklü videolarda bu kontrol ek zaman alabilir.
 
 [Uygulama incelemesi](docs/application-review.md), geliştirme önceliklerini ve
 test açıklarını anlatır. Her kaynak için en iyi tek model veya tek ön ayar yoktur.

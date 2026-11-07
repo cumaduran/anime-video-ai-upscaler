@@ -312,6 +312,10 @@ class CompareDialog(QDialog):
             self.active_settings = self.sample_settings()
             self.sample_started_at = time.monotonic()
             self.active_settings.validate()
+            if self.media.dovi_profile == 7:
+                raise ValueError('Profile 7 sample comparison cannot combine the enhancement layer; process a short copy instead.')
+            if self.media.dovi_profile == 5 and not self.active_settings.high_precision:
+                raise ValueError('Dolby Vision profile 5 requires high-precision AI and HEVC output using libx265 or hevc_nvenc.')
             self.active_model_label = self.describe_model(self.active_settings)
             self.after_heading.setText(self.tr("Processed sample") + " · " + self.active_model_label)
             if self.media.duration and self.start_time.value() + self.length.value() > self.media.duration + 0.01:
@@ -344,12 +348,19 @@ class CompareDialog(QDialog):
             process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
             self.sample_start = self.start_time.value()
             self.sample_length = self.length.value()
-            command = [self.tools["ffmpeg"], "-hide_banner", "-loglevel", "error", "-nostdin", "-n",
+            if self.media.dovi_profile == 5:
+                from .pipeline import display_orientation_filters, dovi5_converter, dovi5_pq_filters
+                executable = dovi5_converter(self.tools, self.active_settings.gpu)
+            else:
+                executable = [self.tools['ffmpeg']]
+            command = executable + (["-noautorotate"] if self.media.dovi_profile == 5 else []) + ["-hide_banner", "-loglevel", "error", "-nostdin", "-n",
                        "-ss", f"{self.start_time.value():.3f}", "-i", str(self.source),
                        "-t", f"{self.length.value():.3f}", "-map", f"0:{self.media.video_index}",
                        "-an", "-sn", "-dn"]
             if self.active_settings.high_precision:
-                command += ["-vf", f"setparams=color_primaries={self.media.color_primaries}:color_trc={self.media.color_transfer}:colorspace={self.media.color_space}:range={self.media.color_range}",
+                filters = (dovi5_pq_filters() + display_orientation_filters(self.media) if self.media.dovi_profile == 5 else [])
+                filters.append(f"setparams=color_primaries={self.media.color_primaries}:color_trc={self.media.color_transfer}:colorspace={self.media.color_space}:range={self.media.color_range}")
+                command += ["-vf", ','.join(filters),
                             "-color_primaries", self.media.color_primaries, "-color_trc", self.media.color_transfer,
                             "-colorspace", self.media.color_space, "-color_range", self.media.color_range]
             elif self.media.hdr:

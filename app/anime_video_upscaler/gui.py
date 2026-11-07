@@ -592,7 +592,7 @@ class MainWindow(QMainWindow):
         depth_warning.setWordWrap(True)
         depth_warning.setObjectName("muted")
         finish_layout.addWidget(depth_warning)
-        hdr_warning = QLabel(self.tr("HDR normally converts to SDR. High-precision AI keeps PQ/HLG; libx265 copies source HDR10 static metadata, but dynamic metadata is removed."))
+        hdr_warning = QLabel(self.tr("High-precision AI with libx265 or hevc_nvenc supports HDR10, HDR10+ (including multiple windows), Dolby Vision 8.1, profile 5 and profile 7 MEL/FEL. Profiles 5 and 7 are converted to 8.1."))
         hdr_warning.setWordWrap(True)
         hdr_warning.setObjectName("muted")
         finish_layout.addWidget(hdr_warning)
@@ -1165,7 +1165,7 @@ class MainWindow(QMainWindow):
                         lines.append(self.tr("Estimate from comparable completed jobs in this session") + f": {time_range} min · {size_range} MiB · {self.tr('Samples')}: {count}")
                         lines.append(self.tr("Output size includes audio and subtitles. Different content and processing conditions may change these estimates."))
                     if media.hdr:
-                        message = ("Experimental HDR AI uses models trained for SDR. Colors and highlights may change. libx265 copies source HDR10 static metadata; dynamic metadata is removed. Compare a short sample before processing long videos."
+                        message = ("Experimental HDR AI uses SDR-trained models; colors and highlights may change. Metadata is copied, not recalculated. Dolby Vision profiles 5 and 7 are converted to 8.1; FEL needs an AVX2 processor. Compare a short output."
                                    if job.settings.high_precision else "HDR input is tone-mapped to SDR (BT.709); HDR highlights and metadata are not preserved.")
                         lines.append(self.tr(message))
             except (OSError, ValueError) as error:
@@ -1449,7 +1449,7 @@ class MainWindow(QMainWindow):
                         return
                 hdr_high = [job.source.name for job in jobs if job.source_hdr and job.settings.high_precision]
                 if hdr_high:
-                    message = self.tr("Experimental HDR AI uses models trained for SDR. Colors and highlights may change. libx265 copies source HDR10 static metadata; dynamic metadata is removed. Compare a short sample before processing long videos.")
+                    message = self.tr("Experimental HDR AI uses SDR-trained models; colors and highlights may change. Metadata is copied, not recalculated. Dolby Vision profiles 5 and 7 are converted to 8.1; FEL needs an AVX2 processor. Compare a short output.")
                     message += "\n\n" + "\n".join(hdr_high[:20]) + (f"\n... +{len(hdr_high) - 20}" if len(hdr_high) > 20 else "")
                     if QMessageBox.question(self, self.tr("Experimental HDR AI"), message) != QMessageBox.StandardButton.Yes:
                         return
@@ -1488,7 +1488,7 @@ class MainWindow(QMainWindow):
                 self.error_log_dialog.set_contents(summary, content, path)
             self.error_log_dialog.show()
             self.error_log_dialog.raise_()
-        unknown = job.state in ("probe","hdr_metadata_probe","verify_hdr_metadata","subtitle_check","help","filters","encoders","encoder_check","normalize","assemble","verify","verify_ai")
+        unknown = job.state in ("probe","rife_cfr_probe","hdr_metadata_probe","hdr_dynamic_prepare","hdr_dynamic_finish","dovi5_color_check","verify_hdr_metadata","verify_vfr_source","verify_vfr_output","subtitle_check","help","filters","encoders","encoder_check","normalize","assemble","verify","verify_ai")
         self.progress.setRange(0,0 if unknown else 100)
         self.progress.setValue(int(job.percent))
         self._refresh_start_controls()

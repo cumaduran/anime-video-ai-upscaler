@@ -41,9 +41,9 @@ def test_packet_timing_verification_accepts_matching_video_and_rejects_truncatio
 def test_hdr_static_metadata_warns_when_encoder_cannot_preserve_it(app, monkeypatch):
     runner = QueueRunner()
     runner.current = type('Job', (), {'settings': replace(Settings(), engine='rife', high_precision=True,
-                                                         codec='hevc_nvenc', pixel_format='p010le', preset='p6')})()
+                                                         codec='hevc_amf', pixel_format='p010le', preset='balanced')})()
     runner.media = Media(96, 64, 1, 2, hdr=True)
-    runner.probe_data = {'streams': []}
+    runner.probe_data = {'streams': [{'index': 0, 'codec_type': 'video', 'codec_name': 'av1'}]}
     runner._recovery_warning = ''
     runner.stage = 'hdr_metadata_probe'
     runner._capture = json.dumps({'frames': [{'side_data_list': [
@@ -422,6 +422,37 @@ def test_high_precision_cugan_multitile_matches_reference(app, tools, tmp_path, 
                              '-f', 'null', '-'], check=True, capture_output=True, text=True, timeout=30)
     match = re.search(r'average:([0-9.]+)', result.stderr)
     assert match and float(match.group(1)) > (30 if model == 'models-pro' else 40)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize('finishing', [False, True])
+def test_hevc_nvenc_preserves_hdr10_static_metadata(app, tools, media_files, tmp_path, finishing):
+    engine = Path(tools['video2x'])
+    if not engine.is_file() or 'rgb16-realcugan-tiled-v1' not in run([str(engine), '--help']):
+        pytest.skip('High-precision engine is required')
+    source = tmp_path / 'source.mkv'
+    run([tools['ffmpeg'], '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=256x256:rate=2:duration=1',
+         '-vf', 'setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv',
+         '-c:v', 'libx265', '-preset', 'ultrafast', '-x265-params',
+         'log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400',
+         '-pix_fmt', 'yuv420p10le', '-color_primaries', 'bt2020', '-color_trc', 'smpte2084',
+         '-colorspace', 'bt2020nc', '-color_range', 'tv', str(source)])
+    settings = replace(Settings(), engine='realcugan', cugan_model='models-nose', cugan_syncgap=0, scale=2, noise=0,
+                       high_precision=True, codec='hevc_nvenc', pixel_format='p010le', preset='p4', target='native',
+                       aspect='fit', output_dir=str(tmp_path), copy_subtitles=False,
+                       subtitle_mode='burn' if finishing else 'off', subtitle_path=str(media_files[1]) if finishing else '',
+                       watermark_path=str(media_files[2]) if finishing else '', watermark_width=32, watermark_margin=4)
+    runner = QueueRunner(); job = runner.enqueue([source], settings)[0]
+    wait_runner(app, runner, tools, timeout=120_000)
+    assert job.state == 'done', job.error
+    def metadata(path):
+        result = json.loads(run([tools['ffprobe'], '-v', 'error', '-read_intervals', '%+#10', '-select_streams', 'v:0',
+                                 '-show_frames', '-show_entries', 'frame=side_data_list', '-of', 'json', str(path)]))
+        return {item['side_data_type']: item for item in result['frames'][0].get('side_data_list', [])
+                if item.get('side_data_type') in ('Mastering display metadata', 'Content light level metadata')}
+    expected = metadata(source)
+    assert set(expected) == {'Mastering display metadata', 'Content light level metadata'}
+    assert metadata(job.output) == expected
 
 
 @pytest.mark.gpu

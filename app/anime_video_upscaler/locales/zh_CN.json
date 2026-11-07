@@ -346,7 +346,7 @@
     "Русский": "Русский"
   },
   "help": {
-    "high_precision": "实验功能：支持 Real-ESRGAN, Anime4K、支持同步的 Real-CUGAN，或支持 UHD 的 RIFE；需要 10 位 4:2:0 输出和明确标记色彩信息的 BT.709 或 BT.2020 PQ/HLG 源。断点续传会存储较大的无损 16 位片段；HDR 水印和烧录字幕使用标称 100 尼特参考白；HLG 亮度还取决于显示器。模型针对 SDR 训练，HDR 颜色可能变化。libx265 会复制 HDR10 静态母版和亮度元数据；动态元数据会被移除。请先比较短片段。",
+    "high_precision": "实验功能：支持 Real-ESRGAN, Anime4K、支持同步的 Real-CUGAN，或支持 UHD 的 RIFE；需要 10 位 4:2:0 输出和明确标记色彩信息的 BT.709 或 BT.2020 PQ/HLG 源。断点续传会存储较大的无损 16 位片段；HDR 水印和烧录字幕使用标称 100 尼特参考白；HLG 亮度还取决于显示器。模型针对 SDR 训练，HDR 颜色可能变化。libx265 和 hevc_nvenc 会保留 HDR10 静态元数据；兼容的 HEVC 源还支持 HDR10+ 和杜比视界配置文件 8.1。元数据不会重新计算。请先比较短片段。",
     "audio_bitrate": "AAC 码率（位/秒）: 32,000–512,000 bits/s; AAC only. Higher output bitrate cannot recover lost audio details.",
     "restoration": "AI 前降噪: optional mild temporal denoise; may soften fine detail. Compare a short sample.",
     "watermark_x": "水印水平位置: 0 = left, 1 = right. Drag the watermark in preview.",

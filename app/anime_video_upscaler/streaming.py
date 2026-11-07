@@ -23,12 +23,13 @@ class StreamingJob(QThread):
     log = Signal(str)
 
     def __init__(self, settings, tools, source, output, work, media, help_text,
-                 subtitle_name='', watermark_name='', parent=None):
+                 subtitle_name='', watermark_name='', parent=None, dynamic_metadata=None):
         super().__init__(parent)
         self.settings, self.tools = settings, tools
         self.source, self.output, self.work, self.media = source, output, work, media
         self.help_text = help_text
         self.subtitle_name, self.watermark_name = subtitle_name, watermark_name
+        self.dynamic_metadata = dynamic_metadata
         self.error = ''
         self.source_frames = self.encoded_frames = 0
         self._stop_reason = ''
@@ -88,23 +89,50 @@ class StreamingJob(QThread):
 
     def run(self):
         try:
-            from .pipeline import hdr_to_sdr_filters, high_precision_input_filters
+            from .pipeline import display_orientation_filters, dovi5_converter, dovi5_pq_filters, hdr_to_sdr_filters, high_precision_input_filters
             filters = high_precision_input_filters(self.media) if self.settings.high_precision else hdr_to_sdr_filters(self.media)
+            decoder = [self.tools['ffmpeg']]
+            if self.media.dovi_profile == 5:
+                decoder = dovi5_converter(self.tools, self.settings.gpu)
+                filters = dovi5_pq_filters() + display_orientation_filters(self.media) + high_precision_input_filters(self.media)
             if self.settings.restoration == 'mild':
                 if self.settings.high_precision:
-                    filters.insert(0, 'hqdn3d=1.5:1.5:3:3')
+                    filters.insert(len(dovi5_pq_filters()) if self.media.dovi_profile == 5 else 0,
+                                   'hqdn3d=1.5:1.5:3:3')
                 else:
                     filters.append('hqdn3d=1.5:1.5:3:3')
             filters.append('setpts=PTS-STARTPTS')
-            decode = [self.tools['ffmpeg'],'-hide_banner','-v','error','-nostdin',
+            decode = decoder + (['-noautorotate'] if self.media.dovi_profile == 5 else []) + ['-hide_banner','-v','error','-nostdin',
                 '-i',str(self.source),'-map',f'0:{self.media.video_index}','-an','-sn','-dn',
                 '-vf',','.join(filters),'-c:v','rawvideo','-pix_fmt',
                 'gbrp16le' if self.settings.high_precision else 'bgr0','-fps_mode','passthrough',
                 '-progress','pipe:2','-nostats','-f','nut','pipe:1']
-            first = self._start(decode,'decode',stdout=subprocess.PIPE)
+            fel = self.dynamic_metadata
+            if fel and fel.fel_bl:
+                helper = Path(self.tools['ffmpeg']).resolve().parent.parent / 'fel-baker'
+                bake = [str(helper / 'python' / 'python.exe'), '-u', str(helper / 'fel-bake.py'),
+                        str(fel.fel_bl), str(fel.fel_el), str(fel.source_frames),
+                        str(self.media.width), str(self.media.height), str(helper),
+                        ','.join(map(str, self.media.display_orientation)), str(self.media.rotation)]
+                baker = self._start(bake, 'FEL', stdout=subprocess.PIPE)
+                self._reader(baker.stderr, 'FEL')
+                decode = [self.tools['ffmpeg'], '-hide_banner', '-v', 'error', '-nostdin',
+                          '-f', 'rawvideo', '-pixel_format', 'gbrp16le', '-video_size',
+                          f'{self.media.width}x{self.media.height}', '-framerate', str(self.media.fps),
+                          '-i', 'pipe:0', '-vf', 'setpts=PTS-STARTPTS', '-c:v', 'rawvideo',
+                          '-pix_fmt', 'gbrp16le', '-fps_mode', 'passthrough', '-progress', 'pipe:2',
+                          '-nostats', '-f', 'nut', 'pipe:1']
+                first = self._start(decode, 'decode', stdin=baker.stdout, stdout=subprocess.PIPE)
+                baker.stdout.close()
+            else:
+                first = self._start(decode,'decode',stdout=subprocess.PIPE)
             self._reader(first.stderr,'decode',True)
             native = ai_command(self.settings,self.tools,Path('pipe:0'),Path('pipe:1.nut'),self.media,self.help_text)
             native[native.index('-c')+1] = 'rawvideo'
+            # Preserve source timing even when a container's nominal and
+            # average rates happen to hide a variable-rate sequence.
+            if self.settings.engine != 'rife' and '--no-recalculate-pts' in self.help_text and '--no-recalculate-pts' not in native:
+                native += ['--no-recalculate-pts']
             native += ['--no-progress','--log-level','warn']
             # Resolve model resources beside the engine, while staging finishing
             # sidecars in our own working directory for the final encoder.

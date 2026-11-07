@@ -12,7 +12,7 @@ foreach ($name in @('avue-engine.exe','libvideo2x.dll','librealesrgan-ncnn-vulka
     if (-not (Test-Path -LiteralPath (Join-Path $nativeBuild $name) -PathType Leaf)) { throw "Build the fixed native engine first: $name" }
 }
 
-foreach ($path in @('ffmpeg\ffmpeg.exe','ffmpeg\ffprobe.exe','PROVENANCE.txt')) {
+foreach ($path in @('ffmpeg\ffmpeg.exe','ffmpeg\ffprobe.exe','dovi-ffmpeg\ffmpeg.exe','hdr-metadata\dovi_tool.exe','hdr-metadata\hdr10plus_tool.exe','hdr-metadata\mkvmerge.exe','fel-baker\python\python.exe','fel-baker\felbaker.dll','fel-baker\ffms2.dll','fel-baker\fel-bake.py','licenses\mkvtoolnix-GPL-2.0.txt','PROVENANCE.txt')) {
     if (-not (Test-Path -LiteralPath (Join-Path $runtime $path) -PathType Leaf)) { throw "Prepare runtime first: $path" }
 }
 if (-not (Test-Path -LiteralPath (Join-Path $runtime 'engine\avue-engine.exe') -PathType Leaf) -and -not (Test-Path -LiteralPath (Join-Path $runtime 'engine\video2x.exe') -PathType Leaf)) { throw 'Prepare runtime first: AI engine missing.' }
@@ -74,6 +74,7 @@ foreach ($name in @('msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll')) {
     $source = Join-Path $qtRoot $name
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Native C++ runtime missing: $name" }
     Copy-Item -LiteralPath $source -Destination (Join-Path $bundledEngine $name) -Force
+    Copy-Item -LiteralPath $source -Destination (Join-Path $bundledRuntime 'fel-baker\python') -Force
 }
 
 $bundledRuntime = Join-Path $appDir 'runtime'
