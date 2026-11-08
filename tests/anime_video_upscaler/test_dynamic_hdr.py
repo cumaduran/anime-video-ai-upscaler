@@ -82,6 +82,99 @@ def test_real_profile7_fel_sample_separates_both_layers(app, tmp_path):
     assert result.converted_profile7 and result.dovi.is_file()
 
 
+def test_real_profile7_fel_comparison_preserves_both_layers(app, tmp_path):
+    from anime_video_upscaler.profile7_sample import Profile7SampleWorker
+    from anime_video_upscaler.pipeline import high_precision_output_filters
+    source = Path(os.environ.get('ANIME_TEST_DOVI_FEL_SAMPLE', ''))
+    ffmpeg = Path(os.environ.get('ANIME_TEST_FFMPEG', ''))
+    ffprobe = Path(os.environ.get('ANIME_TEST_FFPROBE', ''))
+    if not all(path.is_file() for path in (source, ffmpeg, ffprobe)):
+        pytest.skip('Set ANIME_TEST_DOVI_FEL_SAMPLE and FFmpeg tools')
+    probe = json.loads(_run([ffprobe, '-v', 'error', '-show_streams', '-show_format', '-of', 'json', source]).stdout)
+    media = Media.from_probe(probe)
+    settings = replace(Settings(), engine='libplacebo', high_precision=True, codec='libx265', pixel_format='yuv420p10le')
+    worker = Profile7SampleWorker({'ffmpeg': str(ffmpeg), 'ffprobe': str(ffprobe)}, source, tmp_path, media, settings, 0, 1)
+    worker.run()
+    assert not worker.error, worker.error
+    clip = tmp_path / 'sample.mkv'
+    result = _run([ffmpeg, '-v', 'error', '-i', clip, '-frames:v', '1', '-pix_fmt', 'yuv420p10le', '-f', 'framemd5', '-']).stdout.splitlines()[-1].split(b',')[-1].strip()
+    helper = ffmpeg.parent.parent / 'fel-baker'
+    baker = subprocess.Popen([str(x) for x in (helper / 'python/python.exe', '-u', helper / 'fel-bake.py',
+        tmp_path / 'fel-base.hevc', tmp_path / 'fel-enhancement.hevc', 1, media.width, media.height, helper, '', 0, 0, 1)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    reference = subprocess.run([str(ffmpeg), '-v', 'error', '-f', 'rawvideo', '-pixel_format', 'gbrp16le',
+        '-video_size', f'{media.width}x{media.height}', '-framerate', str(media.fps), '-i', 'pipe:0',
+        '-vf', ','.join(high_precision_output_filters(media)), '-frames:v', '1', '-pix_fmt', 'yuv420p10le',
+        '-f', 'framemd5', '-'], stdin=baker.stdout, capture_output=True, check=True, timeout=120)
+    baker.stdout.close()
+    assert baker.wait(timeout=30) == 0, baker.stderr.read().decode('utf-8', 'replace')
+    assert result == reference.stdout.splitlines()[-1].split(b',')[-1].strip()
+
+
+def test_profile7_mel_sample_preparation(app, tmp_path, monkeypatch):
+    from anime_video_upscaler.profile7_sample import Profile7SampleWorker
+    ffmpeg = Path(os.environ.get('ANIME_TEST_FFMPEG', ''))
+    ffprobe = Path(os.environ.get('ANIME_TEST_FFPROBE', ''))
+    dovi = ffmpeg.parent.parent / 'hdr-metadata/dovi_tool.exe'
+    hdr = ffmpeg.parent.parent / 'hdr-metadata/hdr10plus_tool.exe'
+    if not all(path.is_file() for path in (ffmpeg, ffprobe, dovi, hdr)):
+        pytest.skip('Real media tools are required')
+    source = _sample(tmp_path, ffmpeg, 'p7mel', hdr, dovi)
+    probe = json.loads(_run([ffprobe, '-v', 'error', '-show_streams', '-show_format', '-of', 'json', source]).stdout)
+    media = Media.from_probe(probe)
+    work = tmp_path / 'preview'; work.mkdir()
+    settings = replace(Settings(), high_precision=True, codec='libx265', pixel_format='yuv420p10le')
+    actions = []
+    original = DynamicHDRWorker._stream_extract
+    def record_action(self, executable, action, output, missing):
+        actions.append(action)
+        return original(self, executable, action, output, missing)
+    monkeypatch.setattr(DynamicHDRWorker, '_stream_extract', record_action)
+    worker = Profile7SampleWorker({'ffmpeg': str(ffmpeg), 'ffprobe': str(ffprobe)}, source, work, media, settings, .2, .6)
+    worker.run()
+    assert not worker.error, worker.error
+    assert actions == ['dovi']
+    frames = json.loads(_run([ffprobe, '-v', 'error', '-count_frames', '-show_streams', '-of', 'json', work / 'sample.mkv']).stdout)['streams'][0]
+    assert int(frames['nb_read_frames']) == 3
+
+
+def test_profile7_comparison_rejects_unverified_variable_timing(app, tmp_path):
+    from anime_video_upscaler.profile7_sample import Profile7SampleWorker
+    media = Media(100, 100, 5, 24, variable_rate=True, dovi_profile=7)
+    worker = Profile7SampleWorker({}, tmp_path / 'source.mkv', tmp_path, media, Settings(), 0, 1)
+    worker.run()
+    assert 'requires constant frame rate' in worker.error
+    assert not (tmp_path / 'sample.mkv').exists()
+
+
+@pytest.mark.gpu
+def test_real_profile7_fel_comparison_dialog(app, tmp_path, monkeypatch):
+    from PySide6.QtCore import QEventLoop, QTimer
+    from anime_video_upscaler.comparison import CompareDialog
+    from anime_video_upscaler.gui import SettingsStore
+    source = Path(os.environ.get('ANIME_TEST_DOVI_FEL_SAMPLE', ''))
+    ffmpeg = Path(os.environ.get('ANIME_TEST_FFMPEG', ''))
+    ffprobe = Path(os.environ.get('ANIME_TEST_FFPROBE', ''))
+    native = Path(os.environ.get('ANIME_TEST_VIDEO2X', ''))
+    if not all(path.is_file() for path in (source, ffmpeg, ffprobe, native)):
+        pytest.skip('Set ANIME_TEST_DOVI_FEL_SAMPLE and real GPU tools')
+    monkeypatch.setenv('ANIME_UPSCALER_HOME', str(tmp_path / 'settings'))
+    probe = json.loads(_run([ffprobe, '-v', 'error', '-show_streams', '-show_format', '-of', 'json', source]).stdout)
+    media = replace(Media.from_probe(probe), duration=1)
+    settings = replace(Settings(), engine='libplacebo', high_precision=True, codec='libx265', pixel_format='yuv420p10le',
+                       preset='ultrafast', target='custom', width=256, height=144)
+    tools = {'ffmpeg': str(ffmpeg), 'ffprobe': str(ffprobe), 'video2x': str(native)}
+    dialog = CompareDialog(source, media, 0, settings, tools, lambda text: text, SettingsStore)
+    dialog.length.setValue(.5)
+    loop = QEventLoop(); timer = QTimer(); timer.setSingleShot(True)
+    timer.timeout.connect(loop.quit)
+    dialog.runner.busy_changed.connect(lambda busy: loop.quit() if not busy else None)
+    timer.start(120000); dialog.start(); loop.exec(); timer.stop()
+    assert dialog.job and dialog.job.state in ('done', 'done_warning'), dialog.status.text()
+    assert dialog.clip.is_file() and dialog.job.output.is_file()
+    dialog.reject()
+
+
 @pytest.mark.parametrize('orientation,width,height,filter_name', [
     ('0,-65536,65536,0', 2160, 3840, 'transpose=2'),
     ('-65536,0,0,65536', 3840, 2160, 'hflip'),
@@ -130,6 +223,40 @@ def test_real_profile7_fel_full_pipeline(app, tmp_path):
     video = next(stream for stream in probe['streams'] if stream['codec_type'] == 'video')
     assert int(video['nb_read_frames']) == 1
     assert any(side.get('dv_profile') == 8 for side in video.get('side_data_list', []))
+
+
+@pytest.mark.gpu
+def test_real_hdr10plus_source_survives_processing(app, tmp_path):
+    source = Path(os.environ.get('ANIME_TEST_HDR10PLUS_SAMPLE', ''))
+    ffmpeg = Path(os.environ.get('ANIME_TEST_FFMPEG', ''))
+    ffprobe = Path(os.environ.get('ANIME_TEST_FFPROBE', ''))
+    native = Path(os.environ.get('ANIME_TEST_VIDEO2X', ''))
+    if not all(path.is_file() for path in (source, ffmpeg, ffprobe, native)):
+        pytest.skip('Set ANIME_TEST_HDR10PLUS_SAMPLE and the real GPU tools')
+    wrapped = tmp_path / 'real-hdr10plus.mkv'
+    _run([ffmpeg, '-v', 'error', '-r', '25', '-i', source, '-c:v', 'copy', wrapped])
+    settings = replace(Settings(), engine='libplacebo', high_precision=True, codec='libx265',
+                       pixel_format='yuv420p10le', preset='ultrafast', target='custom', width=256, height=144,
+                       container='mkv', output_dir=str(tmp_path), copy_subtitles=False, audio='off')
+    runner = QueueRunner(); job = runner.enqueue([wrapped], settings)[0]
+    logs = []; runner.log.connect(logs.append)
+    wait_runner(app, runner, {'ffmpeg': str(ffmpeg), 'ffprobe': str(ffprobe), 'video2x': str(native)}, timeout=180_000)
+    assert job.state == 'done_warning', job.error + '\n' + '\n'.join(logs[-25:])
+    assert 'Dynamic HDR frame count, metadata and output timing verified.' in logs
+
+
+def test_real_dolby_profile84_is_rejected_with_clear_explanation(app, tmp_path):
+    source = Path(os.environ.get('ANIME_TEST_DOVI_P84_SAMPLE', ''))
+    ffmpeg = Path(os.environ.get('ANIME_TEST_FFMPEG', ''))
+    ffprobe = Path(os.environ.get('ANIME_TEST_FFPROBE', ''))
+    if not all(path.is_file() for path in (source, ffmpeg, ffprobe)):
+        pytest.skip('Set ANIME_TEST_DOVI_P84_SAMPLE and FFmpeg tools')
+    probe = json.loads(_run([ffprobe, '-v', 'error', '-show_streams', '-show_format', '-of', 'json', source]).stdout)
+    media = Media.from_probe(probe)
+    worker = DynamicHDRWorker('prepare', {'ffmpeg': str(ffmpeg), 'ffprobe': str(ffprobe)}, source,
+                              tmp_path, media, replace(Settings(), high_precision=True, codec='libx265', pixel_format='yuv420p10le'))
+    with pytest.raises(ValueError, match='profile 8.4'):
+        worker._prepare()
 
 
 def test_profile5_requires_the_high_precision_conversion_path():

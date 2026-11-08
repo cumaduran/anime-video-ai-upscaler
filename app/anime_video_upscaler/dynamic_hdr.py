@@ -294,14 +294,15 @@ class DynamicHDRWorker(QThread):
         self._call([self.tools['ffprobe'], '-v', 'error', '-select_streams', 'v:0',
                     '-show_entries', 'packet=size,pos', '-of', 'csv=p=0', '-o', csv, path])
         result, offset = [], 0
-        for line in csv.read_text(encoding='utf-8').splitlines():
-            fields = line.split(',')
-            if len(fields) < 2 or not fields[0].isdigit() or not fields[1].isdigit():
-                raise ValueError('Cannot verify HEVC packet boundaries for HDR10+')
-            size, position = int(fields[0]), int(fields[1])
-            if size <= 0 or position != offset:
-                raise ValueError('Cannot verify HEVC packet boundaries for HDR10+')
-            result.append((position, size)); offset += size
+        with csv.open(encoding='utf-8') as lines:
+            for line in lines:
+                fields = line.strip().split(',')
+                if len(fields) < 2 or not fields[0].isdigit() or not fields[1].isdigit():
+                    raise ValueError('Cannot verify HEVC packet boundaries for HDR10+')
+                size, position = int(fields[0]), int(fields[1])
+                if size <= 0 or position != offset:
+                    raise ValueError('Cannot verify HEVC packet boundaries for HDR10+')
+                result.append((position, size)); offset += size
         if not result or offset != path.stat().st_size:
             raise ValueError('Cannot verify HEVC packet boundaries for HDR10+')
         return result
@@ -322,11 +323,12 @@ class DynamicHDRWorker(QThread):
                         '-show_entries', entries, '-of', 'csv=p=0', '-o', path, self.source])
         def timestamps(path):
             values = []
-            for line in path.read_text(encoding='utf-8').splitlines():
-                first = line.split(',', 1)[0]
-                if first:
-                    try: values.append(int(first))
-                    except ValueError as error: raise ValueError('Cannot align HDR10+ source timestamps') from error
+            with path.open(encoding='utf-8') as lines:
+                for line in lines:
+                    first = line.strip().split(',', 1)[0]
+                    if first:
+                        try: values.append(int(first))
+                        except ValueError as error: raise ValueError('Cannot align HDR10+ source timestamps') from error
             return values
         pts, display = timestamps(packets), timestamps(frames)
         if len(ranges) != len(pts) or len(pts) != len(display) or len(set(pts)) != len(pts) or sorted(pts) != display:
@@ -365,6 +367,8 @@ class DynamicHDRWorker(QThread):
             raise ValueError('HDR10+ metadata differs after remux; output was not written')
         with stream.open('rb') as source:
             for (offset, size), expected_hex in zip(ranges, expected):
+                if self.isInterruptionRequested():
+                    raise RuntimeError('Processing cancelled')
                 source.seek(offset)
                 actual = extract_hdr10plus_from_access_unit(source.read(size))
                 if actual is None or actual.hex() != expected_hex:
@@ -445,21 +449,25 @@ class DynamicHDRWorker(QThread):
             output.write(f'{float((timestamps[-1] + last_duration - origin) * 1000):.6f}\n')
         return len(timestamps), path
 
-    def _prepare(self):
+    def _prepare(self, *, ignore_hdr10plus=False):
+        if self.media.dovi_profile and self.media.color_transfer == 'arib-std-b67':
+            raise ValueError('Dolby Vision HLG metadata, including profile 8.4, cannot currently be preserved. Use a compatible PQ Dolby Vision source or an HLG source without Dolby Vision metadata.')
         executables = metadata_tools(self.tools['ffmpeg'])
         if any(not path.is_file() for path in executables.values()):
             raise ValueError('HDR10+ and Dolby Vision tools are missing from the application runtime')
         plus = self.work / 'hdr10plus-source.json'
         rpu = self.work / 'dovi-source.bin'
         raw_plus = False
-        try:
-            has_plus = self._stream_extract(executables['hdr10plus'], 'hdr10plus', plus, "File doesn't contain dynamic metadata")
-        except (ValueError, RuntimeError) as error:
-            if self.isInterruptionRequested():
-                raise
-            self.log.emit('Standard HDR10+ parser could not read the source; checking individual window metadata.')
-            self._extract_multwindow_hdr(plus)
-            has_plus = raw_plus = True
+        has_plus = False
+        if not ignore_hdr10plus:
+            try:
+                has_plus = self._stream_extract(executables['hdr10plus'], 'hdr10plus', plus, "File doesn't contain dynamic metadata")
+            except (ValueError, RuntimeError) as error:
+                if self.isInterruptionRequested():
+                    raise
+                self.log.emit('Standard HDR10+ parser could not read the source; checking individual window metadata.')
+                self._extract_multwindow_hdr(plus)
+                has_plus = raw_plus = True
         has_dovi = self._stream_extract(executables['dovi'], 'dovi', rpu, 'No RPU was found in input file')
         needs_retime = self.media.variable_rate and (self.settings.engine == 'rife' or has_plus or has_dovi)
         if not (has_plus or has_dovi or needs_retime):
@@ -499,7 +507,7 @@ class DynamicHDRWorker(QThread):
             if self._dovi_count(rpu, executables['dovi']) != source_count:
                 raise ValueError('Dolby Vision metadata count differs from the source frame count; output was not written')
             if self.media.color_transfer != 'smpte2084':
-                raise ValueError('Only Dolby Vision profile 8.1 with an HDR10 base layer is currently supported')
+                raise ValueError('Dolby Vision HLG metadata, including profile 8.4, cannot currently be preserved. Use a compatible PQ Dolby Vision source or an HLG source without Dolby Vision metadata.')
             probe = self._probe(self.source, '-select_streams', str(self.media.video_index), '-show_streams')
             stream = probe['streams'][0]
             _validate_dovi_display_matrix(stream)

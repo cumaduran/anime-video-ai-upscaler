@@ -274,6 +274,14 @@ def detect_tools() -> dict[str, str]:
 
 
 FACTORY_PRESETS = {
+    "Anime · HDR 10-bit Real-ESRGAN CPU": replace(Settings(), high_precision=True, codec="libx265", pixel_format="yuv420p10le", preset="medium", quality=20),
+    "Anime · HDR 10-bit Real-ESRGAN NVIDIA": replace(Settings(), high_precision=True, codec="hevc_nvenc", pixel_format="p010le", preset="p5", quality=20),
+    "Anime · HDR 10-bit Real-CUGAN CPU": replace(Settings(), engine="realcugan", cugan_model="models-se", cugan_syncgap=1, high_precision=True, codec="libx265", pixel_format="yuv420p10le", preset="medium", quality=20),
+    "Anime · HDR 10-bit Real-CUGAN NVIDIA": replace(Settings(), engine="realcugan", cugan_model="models-se", cugan_syncgap=1, high_precision=True, codec="hevc_nvenc", pixel_format="p010le", preset="p5", quality=20),
+    "Anime · HDR 10-bit Anime4K CPU": replace(Settings(), engine="libplacebo", high_precision=True, codec="libx265", pixel_format="yuv420p10le", preset="medium", quality=20),
+    "Anime · HDR 10-bit Anime4K NVIDIA": replace(Settings(), engine="libplacebo", high_precision=True, codec="hevc_nvenc", pixel_format="p010le", preset="p5", quality=20),
+    "Anime · HDR 10-bit RIFE 2× CPU": replace(Settings(), engine="rife", target="native", fps_multiplier=2, high_precision=True, codec="libx265", pixel_format="yuv420p10le", preset="medium", quality=20),
+    "Anime · HDR 10-bit RIFE 2× NVIDIA": replace(Settings(), engine="rife", target="native", fps_multiplier=2, high_precision=True, codec="hevc_nvenc", pixel_format="p010le", preset="p5", quality=20),
     "Anime · Max quality / small file · CPU HEVC": replace(Settings(), scale=4, codec="libx265", quality=20, preset="slow"),
     "Anime · Max quality / small file · NVIDIA HEVC": replace(Settings(), scale=4, codec="hevc_nvenc", quality=21, preset="p7", extra_options="rc-lookahead=16\nspatial-aq=1"),
     "Anime · Max quality / small file · AMD HEVC": replace(Settings(), scale=4, codec="hevc_amf", quality=21, preset="quality"),
@@ -313,6 +321,7 @@ FACTORY_PRESETS = {
 }
 
 FACTORY_PRESET_DESCRIPTIONS = {
+    **{name: "10-bit high-precision AI · HEVC · HDR10/HDR10+/Dolby Vision compatible sources. HDR models are experimental; source metadata is not recalculated. For variable-frame-rate RIFE use selectable subtitles. FEL requires AVX2 and extra disk space. Compare a short sample." for name in FACTORY_PRESETS if "HDR 10-bit" in name},
     **{name: "4K · 4× AI · HEVC quality/size tradeoff. Output size and quality vary by source; compare a short sample. AI requires a Vulkan GPU; hardware encoding requires the matching GPU." for name in FACTORY_PRESETS if "Max quality / small file" in name},
     "Anime · 4K balanced": "4K UHD · Real-ESRGAN 2× · H.264 CPU · CRF 20. A compatible starting point.",
     "Anime · NVIDIA HEVC": "4K UHD · Real-ESRGAN 2× · NVIDIA HEVC · CQ 22. Efficient output on supported NVIDIA hardware.",

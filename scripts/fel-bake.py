@@ -10,10 +10,13 @@ import sys
 def main():
     if os.name != 'nt' or not ctypes.windll.kernel32.IsProcessorFeaturePresent(40):
         raise RuntimeError('Dolby Vision FEL requires a Windows x64 processor with AVX2 support')
-    if len(sys.argv) != 9:
-        raise ValueError('Expected BL, EL, frame count, width, height, plugin directory, orientation and rotation')
-    bl_path, el_path, count, width, height, plugin_dir, orientation, rotation = sys.argv[1:]
+    if len(sys.argv) not in (9, 11):
+        raise ValueError('Expected BL, EL, frame count, width, height, plugin directory, orientation, rotation and optional frame range')
+    bl_path, el_path, count, width, height, plugin_dir, orientation, rotation = sys.argv[1:9]
     count, width, height = int(count), int(width), int(height)
+    start, end = (int(sys.argv[9]), int(sys.argv[10])) if len(sys.argv) == 11 else (0, count)
+    if not 0 <= start < end <= count:
+        raise ValueError('Invalid Dolby Vision FEL sample frame range')
     import vapoursynth as vs
     core = vs.core
     core.max_cache_size = 1024
@@ -44,7 +47,7 @@ def main():
     if baked.width != width or baked.height != height or baked.format.id != vs.RGB48:
         raise ValueError('Dolby Vision FEL output format or dimensions are invalid')
     out = sys.stdout.buffer
-    for index in range(count):
+    for index in range(start, end):
         if 'DolbyVisionRPU' not in el.get_frame(index).props:
             raise ValueError(f'Dolby Vision FEL metadata is missing at frame {index}')
         frame = baked.get_frame(index)

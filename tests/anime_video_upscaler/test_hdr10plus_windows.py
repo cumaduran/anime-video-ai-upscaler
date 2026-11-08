@@ -1,4 +1,5 @@
 import os
+import random
 from pathlib import Path
 import subprocess
 from dataclasses import replace
@@ -7,7 +8,7 @@ import pytest
 
 from anime_video_upscaler.hdr10plus_windows import (extract_hdr10plus_from_access_unit,
     inject_hdr10plus_into_access_unit, parse_hdr10plus_payload, replace_window_geometries,
-    transform_window_geometries)
+    transform_window_geometries, _Bits)
 from anime_video_upscaler.pipeline import Media
 from anime_video_upscaler.config import Settings
 
@@ -36,6 +37,21 @@ def _payload(count):
     return bytes.fromhex('b5003c000104') + bytes(
         sum(value << (7 - bit) for bit, value in enumerate(values[i:i + 8]))
         for i in range(0, len(values), 8))
+
+
+def test_bit_reader_matches_independent_bit_string_at_unaligned_offsets():
+    generator = random.Random(21)
+    for _ in range(200):
+        data = bytes(generator.randrange(256) for _ in range(32))
+        expected = ''.join(f'{value:08b}' for value in data)
+        reader = _Bits(data)
+        while reader.position < len(expected):
+            width = min(generator.randrange(1, 29), len(expected) - reader.position)
+            start = reader.position
+            assert reader.read(width) == int(expected[start:start + width], 2)
+        assert reader.read(0) == 0
+        with pytest.raises(ValueError, match='Truncated'):
+            reader.read(1)
 
 
 @pytest.mark.parametrize('count', [1, 2, 3])

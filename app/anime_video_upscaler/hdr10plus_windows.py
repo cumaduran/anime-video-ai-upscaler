@@ -20,9 +20,12 @@ class _Bits:
     def read(self, count: int) -> int:
         if count < 0 or self.position + count > len(self.data) * 8:
             raise ValueError('Truncated HDR10+ metadata')
-        value = 0
-        for offset in range(self.position, self.position + count):
-            value = (value << 1) | ((self.data[offset // 8] >> (7 - offset % 8)) & 1)
+        if count == 0:
+            return 0
+        start = self.position // 8
+        end = (self.position + count + 7) // 8
+        value = int.from_bytes(self.data[start:end], 'big')
+        value = (value >> (end * 8 - self.position - count)) & ((1 << count) - 1)
         self.position += count
         return value
 
@@ -118,7 +121,7 @@ def replace_window_geometries(data: bytes, geometries: tuple[WindowGeometry, ...
     original = parse_hdr10plus_payload(data)
     if len(geometries) != len(original.geometries):
         raise ValueError('HDR10+ window geometry count changed')
-    output = bytearray(data)
+    output = int.from_bytes(data, 'big')
     position = len(_T35_HEADER) * 8 + 8 + 2
     for geometry in geometries:
         values = (geometry.left, geometry.top, geometry.right, geometry.bottom,
@@ -131,14 +134,11 @@ def replace_window_geometries(data: bytes, geometries: tuple[WindowGeometry, ...
                 not 1 <= geometry.inner_major <= geometry.outer_major or not 1 <= geometry.outer_minor <= geometry.outer_major):
             raise ValueError('Invalid HDR10+ window geometry')
         for value, width in zip(values, (16, 16, 16, 16, 16, 16, 8, 16, 16, 16, 1)):
-            for shift in range(width - 1, -1, -1):
-                mask = 1 << (7 - position % 8)
-                if (value >> shift) & 1:
-                    output[position // 8] |= mask
-                else:
-                    output[position // 8] &= ~mask
-                position += 1
-    result = bytes(output)
+            shift = len(data) * 8 - position - width
+            mask = ((1 << width) - 1) << shift
+            output = (output & ~mask) | (value << shift)
+            position += width
+    result = output.to_bytes(len(data), 'big')
     parsed = parse_hdr10plus_payload(result)
     if (parsed.geometries != geometries or parsed.windows != original.windows or
             parsed.target_luminance != original.target_luminance or

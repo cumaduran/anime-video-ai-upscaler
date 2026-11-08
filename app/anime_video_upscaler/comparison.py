@@ -25,6 +25,7 @@ class CompareDialog(QDialog):
         self.source, self.media, self.settings, self.tools, self.tr = Path(source), media, settings, tools, translate
         self.store_type = store_type
         self.process = None
+        self.profile7_worker = None
         self.clip_timeout = QTimer(self)
         self.clip_timeout.setSingleShot(True)
         self.clip_timeout.timeout.connect(self._clip_timed_out)
@@ -50,6 +51,8 @@ class CompareDialog(QDialog):
         self.resize(1300, 760)
         layout = QVBoxLayout(self)
         note = QLabel(self.tr("Create a short temporary sample using the selected AI and encoder. Source audio, subtitles and watermark are excluded. Nothing is uploaded."))
+        if media.dovi_profile == 7:
+            note.setText(note.text() + "\n" + self.tr("Profile 7 FEL is combined with its base layer. Comparison uses an HDR10 intermediate and an SDR display preview; Dolby Vision display mapping is not simulated."))
         note.setWordWrap(True)
         layout.addWidget(note)
         controls = QHBoxLayout()
@@ -306,14 +309,14 @@ class CompareDialog(QDialog):
         self.show_log(str(message))
 
     def start(self):
-        if self.process or self.runner.busy:
+        if self.process or self.profile7_worker or self.runner.busy:
             return
         try:
             self.active_settings = self.sample_settings()
             self.sample_started_at = time.monotonic()
             self.active_settings.validate()
-            if self.media.dovi_profile == 7:
-                raise ValueError('Profile 7 sample comparison cannot combine the enhancement layer; process a short copy instead.')
+            if self.media.dovi_profile == 7 and not (self.active_settings.high_precision and self.active_settings.codec in ('libx265', 'hevc_nvenc')):
+                raise ValueError('Dolby Vision profile 7 requires high-precision AI and HEVC output so its enhancement layer is not silently lost.')
             if self.media.dovi_profile == 5 and not self.active_settings.high_precision:
                 raise ValueError('Dolby Vision profile 5 requires high-precision AI and HEVC output using libx265 or hevc_nvenc.')
             self.active_model_label = self.describe_model(self.active_settings)
@@ -343,11 +346,20 @@ class CompareDialog(QDialog):
             self.recovery.setEnabled(False)
             self.cancel_button.setEnabled(True)
             self.status.setText(self.tr("Preparing sample…"))
+            self.sample_start = self.start_time.value()
+            self.sample_length = self.length.value()
+            if self.media.dovi_profile == 7:
+                from .profile7_sample import Profile7SampleWorker
+                worker = Profile7SampleWorker(self.tools, self.source, Path(self.temp.name), self.media,
+                                              self.active_settings, self.sample_start, self.sample_length, self)
+                self.profile7_worker = worker
+                worker.log.connect(self.log_lines.append)
+                worker.finished.connect(self._profile7_finished)
+                worker.start()
+                return
             process = QProcess(self)
             self.process = process
             process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-            self.sample_start = self.start_time.value()
-            self.sample_length = self.length.value()
             if self.media.dovi_profile == 5:
                 from .pipeline import display_orientation_filters, dovi5_converter, dovi5_pq_filters
                 executable = dovi5_converter(self.tools, self.active_settings.gpu)
@@ -426,6 +438,21 @@ class CompareDialog(QDialog):
             self.run_button.setEnabled(True)
             self.cancel_button.setEnabled(False)
             return
+        self._run_prepared_sample()
+
+    def _profile7_finished(self):
+        worker, self.profile7_worker = self.profile7_worker, None
+        error = worker.error
+        worker.deleteLater()
+        if self.closing:
+            self._close_now()
+        elif error:
+            self._show_error(self.tr(error))
+            self._busy_changed(False)
+        else:
+            self._run_prepared_sample()
+
+    def _run_prepared_sample(self):
         try:
             if not self.reference:
                 self.before.set_source(self.clip)
@@ -491,11 +518,13 @@ class CompareDialog(QDialog):
     def cancel(self):
         if self.process:
             self.process.kill()
+        if self.profile7_worker:
+            self.profile7_worker.stop()
         if self.runner.busy:
             self.runner.cancel()
 
     def reject(self):
-        if self.process or self.runner.busy:
+        if self.process or self.profile7_worker or self.runner.busy:
             self.closing = True
             self.status.setText(self.tr("Stopping sample…"))
             self.cancel()
@@ -514,7 +543,7 @@ class CompareDialog(QDialog):
         super().reject()
 
     def closeEvent(self, event):
-        if self.process or self.runner.busy:
+        if self.process or self.profile7_worker or self.runner.busy:
             self.reject()
             event.ignore()
         else:

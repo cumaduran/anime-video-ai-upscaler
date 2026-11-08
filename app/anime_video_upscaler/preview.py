@@ -186,10 +186,11 @@ class PreviewPanel(QFrame):
         self.clock = QLabel("00:00 / 00:00")
         controls.addWidget(self.clock)
         layout.addLayout(controls)
-        note_label = QLabel(self.tr(note or "Sampled source preview (up to 2 fps) · AI, denoise and flicker are not shown · no audio"))
-        note_label.setObjectName("muted")
-        note_label.setWordWrap(True)
-        layout.addWidget(note_label)
+        self.default_note = note or "Sampled source preview (up to 2 fps) · AI, denoise and flicker are not shown · no audio"
+        self.note_label = QLabel(self.tr(self.default_note))
+        self.note_label.setObjectName("muted")
+        self.note_label.setWordWrap(True)
+        layout.addWidget(self.note_label)
         self.debounce = QTimer(self)
         self.debounce.setSingleShot(True)
         self.debounce.setInterval(200)
@@ -231,6 +232,7 @@ class PreviewPanel(QFrame):
         self._stop_playback()
         self._abort()
         self.source, self.media = path, None
+        self.note_label.setText(self.tr(self.default_note))
         self.retry_button.setVisible(False)
         self.status.setToolTip("")
         self.slider.setEnabled(False)
@@ -359,6 +361,8 @@ class PreviewPanel(QFrame):
             try:
                 if kind == "probe":
                     self.media = Media.from_probe(json.loads(bytes(output)))
+                    if self.media.dovi_profile == 7:
+                        self.note_label.setText(self.tr("Profile 7 source preview shows the base layer only. Use AI sample comparison to include a FEL enhancement layer."))
                     self.media_ready.emit(self.media)
                     maximum = min(2_147_483_647, int(self.media.duration * 1000))
                     self.slider.setRange(0, maximum)

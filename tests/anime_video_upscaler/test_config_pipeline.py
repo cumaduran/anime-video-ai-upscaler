@@ -354,6 +354,21 @@ def test_gpu_preset_names_and_factories_are_valid():
 from anime_video_upscaler.config import FACTORY_PRESETS
 
 
+def test_hdr_factory_presets_support_high_precision_hevc_and_dolby_sources():
+    from anime_video_upscaler.pipeline import Media, validate_media
+    presets = {name: settings for name, settings in FACTORY_PRESETS.items() if 'HDR 10-bit' in name}
+    assert len(presets) == 8
+    assert {settings.engine for settings in presets.values()} == {'realesrgan', 'realcugan', 'libplacebo', 'rife'}
+    media = Media(1920, 1080, 10, 24, hdr=True, color_primaries='bt2020',
+                  color_transfer='smpte2084', color_space='bt2020nc', color_range='tv')
+    for name, settings in presets.items():
+        settings.validate()
+        assert settings.high_precision and not settings.resume_segments and settings.restoration == 'off'
+        assert (settings.codec, settings.pixel_format) in (('libx265', 'yuv420p10le'), ('hevc_nvenc', 'p010le'))
+        for profile in (0, 5, 7, 8):
+            validate_media(settings, replace(media, dovi_profile=profile))
+
+
 def test_av1_encoder_quality_ranges_are_codec_specific():
     replace(Settings(),codec='av1_amf',preset='quality',quality=200).validate()
     replace(Settings(),codec='av1_nvenc',preset='p6',quality=63).validate()
